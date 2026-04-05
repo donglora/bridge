@@ -1,0 +1,32 @@
+[package]
+name = "donglora-bridge"
+version = "0.1.0"
+edition = "2024"
+authors = ["Stephen Waits <steve@waits.net>"]
+license = "MIT"
+description = "Peer-to-peer LoRa bridge using iroh and DongLoRa"
+
+[dependencies]
+donglora-client = { path = "../donglora/clients/rust" }
+iroh = "0.97"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+blake3 = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+anyhow = "1"
+dirs = "6"
+bytes = "1"
+rand = "0.9"
+hex = "0.4.3"
+tokio-util = { version = "0.7.18", features = ["rt"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
