@@ -9,6 +9,8 @@ description = "Peer-to-peer LoRa bridge using iroh and DongLoRa"
 [dependencies]
 donglora-client = { path = "../donglora/clients/rust" }
 iroh = "0.97"
+iroh-gossip = "0.97"
+mainline = { version = "6", features = ["async"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,8 +24,10 @@ tracing-appender = "0.2"
 anyhow = "1"
 dirs = "6"
 bytes = "1"
+futures-lite = "2"
 rand = "0.9"
 hex = "0.4.3"
+sha2 = "0.10"
 tokio-util = { version = "0.7.18", features = ["rt"] }
 
 [lints.clippy]

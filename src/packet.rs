@@ -1,10 +1,5 @@
-use iroh::PublicKey;
-
-/// Wire protocol version.
-const VERSION: u8 = 0;
-
-/// Envelope header size: version(1) + origin(32) + seq(8) + rssi(2) + snr(2) + payload_len(2) = 47
-const HEADER_SIZE: usize = 47;
+/// Gossip frame header size: sender(32) + rssi(2) + snr(2) + payload_len(2) = 38
+const FRAME_HEADER_SIZE: usize = 38;
 
 /// SNR quality grade for a received LoRa packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +33,7 @@ impl std::fmt::Display for Grade {
 }
 
 /// Grade a received packet's SNR against the demodulation floor for the given
-/// spreading factor. See PROTOCOL.md for the formula.
+/// spreading factor.
 pub fn snr_grade(snr: i16, sf: u8) -> Grade {
     if !(-32..=32).contains(&snr) {
         return Grade::Invalid;
@@ -54,7 +49,7 @@ pub fn snr_grade(snr: i16, sf: u8) -> Grade {
     }
 }
 
-/// A packet received from the radio, before wrapping in an envelope.
+/// A packet received from the radio, before wrapping in a gossip frame.
 #[derive(Debug, Clone)]
 pub struct RadioPacket {
     pub rssi: i16,
@@ -62,13 +57,13 @@ pub struct RadioPacket {
     pub payload: Vec<u8>,
 }
 
-/// A bridge envelope — the wire format sent between iroh peers.
+/// A gossip frame — the wire format sent through the iroh-gossip swarm.
+///
+/// Wire format: `[sender: 32B] [rssi: i16 LE] [snr: i16 LE] [payload_len: u16 LE] [payload: NB]`
 #[derive(Debug, Clone)]
-pub struct Envelope {
-    /// NodeId of the bridge that first heard this packet on radio.
-    pub origin: PublicKey,
-    /// Per-origin sequence number (monotonically increasing).
-    pub seq: u64,
+pub struct GossipFrame {
+    /// EndpointId (PublicKey bytes) of the bridge that first heard this packet on radio.
+    pub sender: [u8; 32],
     /// RSSI at the originating bridge (informational).
     pub rssi: i16,
     /// SNR at the originating bridge (informational).
@@ -77,13 +72,21 @@ pub struct Envelope {
     pub payload: Vec<u8>,
 }
 
-impl Envelope {
-    /// Encode this envelope into bytes for sending as a QUIC datagram.
+impl GossipFrame {
+    /// Create a new gossip frame from a public key and radio packet data.
+    pub fn new(sender: &iroh::PublicKey, rssi: i16, snr: i16, payload: Vec<u8>) -> Self {
+        Self {
+            sender: *sender.as_bytes(),
+            rssi,
+            snr,
+            payload,
+        }
+    }
+
+    /// Encode this frame into bytes for gossip broadcast.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(HEADER_SIZE + self.payload.len());
-        buf.push(VERSION);
-        buf.extend_from_slice(self.origin.as_bytes());
-        buf.extend_from_slice(&self.seq.to_le_bytes());
+        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + self.payload.len());
+        buf.extend_from_slice(&self.sender);
         buf.extend_from_slice(&self.rssi.to_le_bytes());
         buf.extend_from_slice(&self.snr.to_le_bytes());
         let len = self.payload.len() as u16;
@@ -92,39 +95,30 @@ impl Envelope {
         buf
     }
 
-    /// Decode an envelope from bytes received as a QUIC datagram.
+    /// Decode a gossip frame from bytes received from the swarm.
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < HEADER_SIZE {
+        if data.len() < FRAME_HEADER_SIZE {
             return None;
         }
-        if data[0] != VERSION {
-            return None;
-        }
-        let origin = PublicKey::from_bytes(data[1..33].try_into().ok()?).ok()?;
-        let seq = u64::from_le_bytes(data[33..41].try_into().ok()?);
-        let rssi = i16::from_le_bytes(data[41..43].try_into().ok()?);
-        let snr = i16::from_le_bytes(data[43..45].try_into().ok()?);
-        let payload_len = u16::from_le_bytes(data[45..47].try_into().ok()?) as usize;
-        if data.len() != HEADER_SIZE + payload_len {
+        let sender: [u8; 32] = data[..32].try_into().ok()?;
+        let rssi = i16::from_le_bytes(data[32..34].try_into().ok()?);
+        let snr = i16::from_le_bytes(data[34..36].try_into().ok()?);
+        let payload_len = u16::from_le_bytes(data[36..38].try_into().ok()?) as usize;
+        if data.len() != FRAME_HEADER_SIZE + payload_len {
             return None;
         }
         Some(Self {
-            origin,
-            seq,
+            sender,
             rssi,
             snr,
-            payload: data[HEADER_SIZE..].to_vec(),
+            payload: data[FRAME_HEADER_SIZE..].to_vec(),
         })
     }
 }
 
-/// Compute a 16-byte content hash for deduplication.
-pub fn content_hash(payload: &[u8]) -> [u8; 16] {
-    let hash = blake3::hash(payload);
-    let bytes = hash.as_bytes();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&bytes[..16]);
-    out
+/// Compute a 32-byte blake3 content hash for deduplication.
+pub fn content_hash(payload: &[u8]) -> [u8; 32] {
+    *blake3::hash(payload).as_bytes()
 }
 
 #[cfg(test)]
@@ -146,34 +140,28 @@ mod tests {
     }
 
     #[test]
-    fn envelope_roundtrip() {
+    fn gossip_frame_roundtrip() {
         let key = iroh::SecretKey::generate(&mut rand::rng());
-        let env = Envelope {
-            origin: key.public(),
-            seq: 42,
-            rssi: -85,
-            snr: 8,
-            payload: vec![1, 2, 3, 4, 5],
-        };
-        let encoded = env.encode();
-        let decoded = Envelope::decode(&encoded).unwrap();
-        assert_eq!(decoded.origin, env.origin);
-        assert_eq!(decoded.seq, env.seq);
-        assert_eq!(decoded.rssi, env.rssi);
-        assert_eq!(decoded.snr, env.snr);
-        assert_eq!(decoded.payload, env.payload);
+        let frame = GossipFrame::new(&key.public(), -85, 8, vec![1, 2, 3, 4, 5]);
+        let encoded = frame.encode();
+        let decoded = GossipFrame::decode(&encoded).expect("decode should succeed");
+        assert_eq!(decoded.sender, *key.public().as_bytes());
+        assert_eq!(decoded.rssi, -85);
+        assert_eq!(decoded.snr, 8);
+        assert_eq!(decoded.payload, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
-    fn envelope_reject_short() {
-        assert!(Envelope::decode(&[0u8; 10]).is_none());
+    fn gossip_frame_reject_short() {
+        assert!(GossipFrame::decode(&[0u8; 10]).is_none());
     }
 
     #[test]
-    fn envelope_reject_bad_version() {
-        let mut data = vec![1u8]; // version 1
-        data.extend_from_slice(&[0u8; 46]);
-        assert!(Envelope::decode(&data).is_none());
+    fn gossip_frame_reject_wrong_length() {
+        // Header says payload_len=5 but only 3 bytes follow.
+        let mut data = vec![0u8; 38 + 3];
+        data[36..38].copy_from_slice(&5u16.to_le_bytes());
+        assert!(GossipFrame::decode(&data).is_none());
     }
 
     #[test]

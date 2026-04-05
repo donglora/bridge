@@ -1,25 +1,28 @@
 mod config;
-mod network;
+mod gossip;
 mod packet;
 mod radio;
+mod rate_limit;
 mod router;
+mod setup;
 mod tui;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use iroh::SecretKey;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::network::{Network, PeerConfig};
+use crate::gossip::PassphraseKeys;
+use crate::rate_limit::RateLimiter;
 use crate::router::Stats;
 
 #[derive(Parser)]
-#[command(name = "donglora-bridge", about = "Peer-to-peer LoRa bridge using iroh")]
+#[command(name = "donglora-bridge", about = "LoRa gossip bridge using iroh")]
 struct Cli {
     /// Path to config file (default: ~/.config/donglora-bridge/config.toml)
     #[arg(long)]
@@ -35,10 +38,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Print this bridge's NodeId and exit
-    ShowId,
-    /// Generate an example config and print to stdout
-    GenerateConfig,
+    /// Interactive configuration wizard
+    Config,
 }
 
 #[tokio::main]
@@ -51,34 +52,20 @@ async fn main() -> Result<()> {
         None => config::config_path()?,
     };
 
-    // Load or create secret key.
-    // Secret key lives alongside the config file (same dir, .key extension).
-    let key_path = config_path.with_extension("key");
-    let secret_key = config::load_or_create_secret_key(&key_path)?;
-    let node_id = secret_key.public();
-    let node_id_str = node_id.to_string();
-
-    // Handle subcommands.
-    match cli.command {
-        Some(Commands::ShowId) => {
-            println!("{node_id_str}");
-            return Ok(());
-        }
-        Some(Commands::GenerateConfig) => {
-            print!("{}", config::generate_default_config(&node_id_str));
-            return Ok(());
-        }
-        None => {}
+    // Config subcommand: run wizard with existing config as defaults.
+    if let Some(Commands::Config) = cli.command {
+        let existing = if config_path.exists() {
+            config::load_config(&config_path).ok()
+        } else {
+            None
+        };
+        return setup::run_wizard(&config_path, existing.as_ref());
     }
 
-    // First-run: if config doesn't exist, generate it and exit.
+    // First-run: no config file → run wizard automatically.
     if !config_path.exists() {
-        config::write_default_config(&config_path, &node_id_str)?;
-        println!("Generated config at {}", config_path.display());
-        println!("Your NodeId: {node_id_str}");
-        println!();
-        println!("Add peers to your config and run again!");
-        return Ok(());
+        println!("  No config found. Let's set one up!\n");
+        return setup::run_wizard(&config_path, None);
     }
 
     // Load config.
@@ -94,7 +81,6 @@ async fn main() -> Result<()> {
             )
             .init();
     } else {
-        // Log to file in TUI mode.
         let log_path = cfg
             .bridge
             .log_file
@@ -117,38 +103,32 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    info!("donglora-bridge starting, NodeId: {node_id_str}");
+    // Ephemeral identity — fresh keypair each launch.
+    let secret_key = SecretKey::generate(&mut rand::rng());
+    let node_id = secret_key.public();
+    info!("donglora-bridge starting, ephemeral id: {}", node_id.fmt_short());
 
     // Parse radio config.
     let radio_config = cfg.radio.to_radio_config()?;
-    let radio_config_str = radio::format_radio_config(&radio_config);
 
-    // Parse peer configs.
-    let mut peer_configs = Vec::new();
-    let mut peer_names: HashMap<iroh::PublicKey, String> = HashMap::new();
-    for entry in &cfg.peers {
-        let pk = entry.public_key()?;
-        let name = entry.display_name();
-        peer_names.insert(pk, name.clone());
-        peer_configs.push(PeerConfig {
-            public_key: pk,
-            name,
-            addresses: entry.addresses.clone(),
-        });
-    }
+    // Derive passphrase keys.
+    let keys = PassphraseKeys::derive(&cfg.bridge.passphrase);
+    info!("topic: {}", hex::encode(&keys.topic_id.as_bytes()[..8]));
 
-    if peer_configs.is_empty() && !cli.log_only {
-        println!("No peers configured. Add peers to {} and run again.", config_path.display());
-        println!("Your NodeId: {node_id_str}");
-        return Ok(());
-    }
+    // Create rate limiter.
+    let rate_limiter = RateLimiter::from_radio_config(
+        radio_config.sf,
+        radio_config.bw,
+        radio_config.cr,
+        radio_config.preamble_len,
+        cfg.bridge.rate_limit_pps,
+    );
+    info!("rate limiter: {:.1} pps", rate_limiter.rate_pps());
 
-    // Create network.
-    let network = Arc::new(Network::new(secret_key, peer_configs).await?);
-    info!("iroh endpoint bound, id: {node_id_str}");
-
-    // Start network.
-    let (net_event_rx, net_send_tx) = network.start();
+    // Create gossip network.
+    let (swarm, gossip_event_rx, gossip_frame_tx) =
+        gossip::Gossip::new(secret_key, &keys).await?;
+    let swarm = Arc::new(swarm);
 
     // Start radio.
     let (radio_event_rx, radio_tx) = radio::spawn(radio_config, cfg.radio.port.clone());
@@ -158,14 +138,15 @@ async fn main() -> Result<()> {
     let (log_tx, log_rx) = mpsc::channel(512);
     let (config_watch_tx, config_watch_rx) = tokio::sync::watch::channel(
         router::RadioConfigInfo {
-            config_str: radio_config_str,
+            active: radio_config,
+            requested: radio_config,
             source: radio::ConfigSource::Ours,
+            device: String::new(),
         },
     );
 
     // Cancellation.
     let cancel = CancellationToken::new();
-
     let start_time = Instant::now();
 
     // Spawn router.
@@ -174,18 +155,18 @@ async fn main() -> Result<()> {
     let router_our_id = node_id;
     let dedup_window = std::time::Duration::from_secs(cfg.bridge.dedup_window_secs);
     let tx_queue_size = cfg.bridge.tx_queue_size;
-    let router_peer_names = peer_names;
 
     tokio::spawn(async move {
         router::run(
             router_our_id,
             dedup_window,
             tx_queue_size,
-            router_peer_names,
+            radio_config,
+            rate_limiter,
             radio_event_rx,
             radio_tx,
-            net_event_rx,
-            net_send_tx,
+            gossip_event_rx,
+            gossip_frame_tx,
             &router_stats,
             log_tx,
             config_watch_tx,
@@ -197,7 +178,6 @@ async fn main() -> Result<()> {
     // Run TUI or headless.
     if cli.log_only {
         info!("running in headless mode");
-        // Just wait for cancellation or ctrl-c.
         tokio::select! {
             () = cancel.cancelled() => {},
             result = tokio::signal::ctrl_c() => {
@@ -208,26 +188,30 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        // Run TUI (blocks until q or cancel).
-        if let Err(e) = tui::run(
-            node_id,
+        let terminal = tui::run(
             config_watch_rx,
-            network.clone(),
+            swarm.clone(),
             stats,
             log_rx,
             cancel.clone(),
             start_time,
         )
-        .await
-        {
-            // Restore terminal before printing error.
-            eprintln!("TUI error: {e:#}");
+        .await;
+
+        cancel.cancel();
+        swarm.shutdown().await;
+        info!("donglora-bridge stopped");
+
+        if let Ok(mut term) = terminal {
+            tui::restore_terminal(&mut term);
         }
+
+        return Ok(());
     }
 
-    // Shutdown.
+    // Shutdown (headless path).
     cancel.cancel();
-    network.shutdown().await;
+    swarm.shutdown().await;
     info!("donglora-bridge stopped");
 
     Ok(())

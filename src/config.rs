@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use donglora_client::{Bandwidth, RadioConfig, TX_POWER_MAX};
-use iroh::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 
 /// Top-level bridge configuration.
@@ -12,11 +11,9 @@ pub struct Config {
     pub radio: RadioSection,
     #[serde(default)]
     pub bridge: BridgeSection,
-    #[serde(default)]
-    pub peers: Vec<PeerEntry>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RadioSection {
     /// Serial port path (auto-detect if omitted).
     pub port: Option<String>,
@@ -32,36 +29,34 @@ pub struct RadioSection {
     pub sync_word: u16,
     #[serde(default = "default_tx_power")]
     pub tx_power: String,
-    #[serde(default)]
+    #[serde(default = "default_preamble")]
     pub preamble: u16,
     #[serde(default = "default_true")]
     pub cad: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BridgeSection {
+    /// Shared passphrase. All bridges with the same passphrase join the same swarm.
+    #[serde(default)]
+    pub passphrase: String,
     #[serde(default = "default_dedup_window")]
     pub dedup_window_secs: u64,
     #[serde(default = "default_tx_queue_size")]
     pub tx_queue_size: usize,
+    /// Optional manual override for the radio TX rate limit (packets per second).
+    /// If omitted, a rate is calculated from the radio config.
+    pub rate_limit_pps: Option<f64>,
     pub log_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PeerEntry {
-    pub node_id: String,
-    pub name: Option<String>,
-    #[serde(default)]
-    pub addresses: Vec<String>,
-}
-
-// ── Defaults ──────────────────────────────────────────────────────
+// ── Defaults (MeshCore US/Canada Recommended) ────────────────────
 
 fn default_frequency() -> u32 {
-    915_000_000
+    910_525_000
 }
 fn default_bandwidth() -> String {
-    "125kHz".into()
+    "62.5kHz".into()
 }
 fn default_sf() -> u8 {
     7
@@ -70,16 +65,19 @@ fn default_cr() -> u8 {
     5
 }
 fn default_sync_word() -> u16 {
-    0x1424
+    0x3444
 }
 fn default_tx_power() -> String {
-    "max".into()
+    "22".into()
+}
+fn default_preamble() -> u16 {
+    16
 }
 fn default_true() -> bool {
     true
 }
 fn default_dedup_window() -> u64 {
-    30
+    300
 }
 fn default_tx_queue_size() -> usize {
     32
@@ -95,7 +93,7 @@ impl Default for RadioSection {
             coding_rate: default_cr(),
             sync_word: default_sync_word(),
             tx_power: default_tx_power(),
-            preamble: 0,
+            preamble: default_preamble(),
             cad: true,
         }
     }
@@ -104,8 +102,10 @@ impl Default for RadioSection {
 impl Default for BridgeSection {
     fn default() -> Self {
         Self {
+            passphrase: String::new(),
             dedup_window_secs: default_dedup_window(),
             tx_queue_size: default_tx_queue_size(),
+            rate_limit_pps: None,
             log_file: None,
         }
     }
@@ -153,31 +153,6 @@ impl RadioSection {
     }
 }
 
-// ── Peer parsing ──────────────────────────────────────────────────
-
-impl PeerEntry {
-    /// Parse the node_id string into an iroh PublicKey.
-    pub fn public_key(&self) -> Result<PublicKey> {
-        self.node_id
-            .parse::<PublicKey>()
-            .map_err(|e| anyhow::anyhow!("invalid node_id '{}': {e}", self.node_id))
-    }
-
-    /// Display name: the configured name, or a truncated NodeId.
-    pub fn display_name(&self) -> String {
-        if let Some(name) = &self.name {
-            name.clone()
-        } else {
-            let id = &self.node_id;
-            if id.len() > 12 {
-                format!("{}...", &id[..12])
-            } else {
-                id.clone()
-            }
-        }
-    }
-}
-
 // ── File I/O ──────────────────────────────────────────────────────
 
 /// Default config directory: `$XDG_CONFIG_HOME/donglora-bridge/` or `~/.config/donglora-bridge/`.
@@ -193,12 +168,6 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }
 
-/// Default secret key file path (alongside default config).
-#[allow(dead_code)]
-pub fn secret_key_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("config.key"))
-}
-
 /// Default log file path: `$XDG_STATE_HOME/donglora-bridge/bridge.log`.
 pub fn default_log_path() -> Result<PathBuf> {
     let dir = dirs::state_dir()
@@ -208,79 +177,15 @@ pub fn default_log_path() -> Result<PathBuf> {
     Ok(dir.join("bridge.log"))
 }
 
-/// Load config from a TOML file.
+/// Load config from a TOML file. Returns None-passphrase error if not set.
 pub fn load_config(path: &Path) -> Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config: {}", path.display()))?;
-    toml::from_str(&text).context("parsing config TOML")
-}
-
-/// Load or generate the persistent secret key.
-pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
-    if path.exists() {
-        let hex = std::fs::read_to_string(path)
-            .with_context(|| format!("reading secret key: {}", path.display()))?;
-        let hex = hex.trim();
-        let bytes = hex::decode(hex).context("decoding secret key hex")?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
-        Ok(SecretKey::from_bytes(&arr))
-    } else {
-        let key = SecretKey::generate(&mut rand::rng());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating directory: {}", parent.display()))?;
-        }
-        let hex = hex::encode(key.to_bytes());
-        std::fs::write(path, &hex)
-            .with_context(|| format!("writing secret key: {}", path.display()))?;
-        Ok(key)
+    let cfg: Config = toml::from_str(&text).context("parsing config TOML")?;
+    if cfg.bridge.passphrase.is_empty() || cfg.bridge.passphrase == "change-me" {
+        bail!(
+            "passphrase is required — run `donglora-bridge config` to set it"
+        );
     }
-}
-
-/// Generate a default config file with the given NodeId embedded as a comment.
-pub fn generate_default_config(node_id: &str) -> String {
-    format!(
-        r#"# donglora-bridge configuration
-# Auto-generated — add peers to get started!
-# Your NodeId: {node_id}
-
-[radio]
-# port = "/dev/ttyACM0"        # auto-detect if omitted
-frequency = 915_000_000
-bandwidth = "125kHz"
-spreading_factor = 7
-coding_rate = 5
-sync_word = 0x1424
-tx_power = "max"
-preamble = 0                    # 0 = firmware default (16 symbols)
-cad = true
-
-[bridge]
-dedup_window_secs = 30
-tx_queue_size = 32
-# log_file = "/tmp/donglora-bridge.log"
-
-# Add peers below. Each peer needs the remote bridge's NodeId.
-# Share your NodeId (above) with peers so they can add you too.
-#
-# [[peers]]
-# node_id = "paste-node-id-here"
-# name = "My Friend's Bridge"
-# addresses = ["1.2.3.4:1234"]  # optional direct address hints
-"#
-    )
-}
-
-/// Write the default config to disk (first-run flow).
-pub fn write_default_config(path: &Path, node_id: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating directory: {}", parent.display()))?;
-    }
-    let content = generate_default_config(node_id);
-    std::fs::write(path, content)
-        .with_context(|| format!("writing config: {}", path.display()))?;
-    Ok(())
+    Ok(cfg)
 }

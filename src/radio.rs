@@ -20,8 +20,8 @@ pub enum ConfigSource {
 pub enum RadioEvent {
     /// A valid packet received from the radio (already SNR-filtered).
     Packet(RadioPacket),
-    /// Radio connected (or reconnected) with the active config.
-    Connected(RadioConfig, ConfigSource),
+    /// Radio connected (or reconnected) with the active config and device info.
+    Connected(RadioConfig, ConfigSource, String),
     /// Radio disconnected — attempting reconnect.
     Disconnected,
 }
@@ -56,7 +56,6 @@ fn radio_loop(
     loop {
         match connect_and_run(&config, &port, &event_tx, &mut tx_recv) {
             Ok(()) => {
-                // Clean shutdown (channel closed).
                 info!("radio thread exiting");
                 return;
             }
@@ -77,51 +76,57 @@ fn connect_and_run(
     event_tx: &mpsc::Sender<RadioEvent>,
     tx_recv: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    let timeout = Duration::from_secs(2);
+    // Long initial timeout: the mux serializes commands through the dongle,
+    // so our GetConfig might have to wait behind other clients' commands.
+    let timeout = Duration::from_secs(10);
 
     info!("connecting to dongle...");
-    let mut client = if let Some(port) = &port {
-        donglora_client::connect(Some(port), timeout)?
+    let (mut client, device) = if let Some(port) = &port {
+        let c = donglora_client::connect(Some(port), timeout)?;
+        (c, shorten_path(port))
     } else {
-        donglora_client::connect_default()?
+        let c = donglora_client::connect_default()?;
+        (c, "mux".to_string())
     };
+    info!("[radio] transport connected: {device}");
 
-    client.ping()?;
-    info!("dongle connected, configuring radio");
+    info!("[radio] sending ping...");
+    match client.ping() {
+        Ok(()) => info!("[radio] ping OK"),
+        Err(e) => {
+            info!("[radio] ping FAILED: {e:#}");
+            return Err(e);
+        }
+    }
 
-    // Try to set our config. If the mux rejects it (config already locked by
-    // another client), fall back to reading whatever config is active.
-    let (active_config, config_source) = match client.set_config(*config) {
-        Ok(()) => {
-            info!("radio configured with our settings");
-            (*config, ConfigSource::Ours)
+    info!("[radio] negotiating config...");
+    let (active_config, config_source) = match negotiate_config(&mut client, config) {
+        Ok(result) => {
+            info!("[radio] config negotiated: source={:?}, config={}", result.1, format_radio_config(&result.0));
+            result
         }
         Err(e) => {
-            warn!("SetConfig failed ({e:#}), reading active config from mux");
-            match client.get_config() {
-                Ok(mux_config) => {
-                    info!(
-                        "using mux config: {}",
-                        format_radio_config(&mux_config)
-                    );
-                    (mux_config, ConfigSource::Mux)
-                }
-                Err(e2) => {
-                    anyhow::bail!("SetConfig failed ({e:#}) and GetConfig also failed ({e2:#})");
-                }
-            }
+            info!("[radio] config negotiation FAILED: {e:#}");
+            return Err(e);
         }
     };
 
-    client.start_rx()?;
-    info!("radio receiving");
+    info!("[radio] sending start_rx...");
+    match client.start_rx() {
+        Ok(()) => info!("[radio] start_rx OK"),
+        Err(e) => {
+            info!("[radio] start_rx FAILED: {e:#}");
+            return Err(e);
+        }
+    }
 
-    let _ = event_tx.blocking_send(RadioEvent::Connected(active_config, config_source));
+    let _ = event_tx.blocking_send(RadioEvent::Connected(active_config, config_source, device));
 
     // Set a short timeout so we can interleave RX and TX.
     client
         .transport_mut()
         .set_timeout(Duration::from_millis(100))?;
+    info!("[radio] entering main loop");
 
     loop {
         // Check for TX requests (non-blocking).
@@ -143,7 +148,6 @@ fn connect_and_run(
                     );
                     let pkt = RadioPacket { rssi, snr, payload };
                     if event_tx.blocking_send(RadioEvent::Packet(pkt)).is_err() {
-                        // Router dropped — shut down.
                         return Ok(());
                     }
                 } else {
@@ -153,33 +157,81 @@ fn connect_and_run(
                     );
                 }
             }
-            Ok(Some(_)) => {
-                // Non-RxPacket unsolicited response — ignore.
-            }
-            Ok(None) => {
-                // Timeout — no packet, loop back to check TX.
-            }
-            Err(e) if is_timeout_error(&e) => {
-                // Mux sockets return WouldBlock on timeout instead of Ok(0).
-                // Treat the same as Ok(None) — just a timeout, not a real error.
-            }
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(e) if is_timeout_error(&e) => {}
             Err(e) => return Err(e),
         }
 
-        // If the event channel is closed, the router is gone — exit cleanly.
         if event_tx.is_closed() {
             return Ok(());
         }
     }
 }
 
-/// Check if an anyhow::Error wraps a timeout-like I/O error.
+/// Negotiate radio config with the dongle/mux.
 ///
-/// Workaround: donglora-client's `read_frame` handles `TimedOut` but not
-/// `WouldBlock`. On Linux, socket read timeouts return EAGAIN (WouldBlock),
-/// not TimedOut. Serial ports return Ok(0) so they work fine, but mux
-/// sockets surface this as an error. We catch it here instead of letting
-/// it trigger the reconnect loop.
+/// Strategy:
+/// 1. GetConfig first to read what's active (caches the result).
+/// 2. If it matches our desired config, use it — no SetConfig needed.
+/// 3. If it differs, only try SetConfig if we haven't been rejected before.
+/// 4. If SetConfig is rejected, set the flag IMMEDIATELY (before the mux can
+///    disconnect us and lose this state), then return the cached GetConfig result.
+///
+/// On reconnect, the flag ensures we never retry SetConfig.
+fn negotiate_config<T: Transport>(
+    client: &mut donglora_client::Client<T>,
+    desired: &RadioConfig,
+) -> Result<(RadioConfig, ConfigSource)> {
+    info!("[negotiate] get_config...");
+    match client.get_config() {
+        Ok(cfg) => {
+            let source = if configs_match(&cfg, desired) {
+                info!("[negotiate] get_config OK (matches desired): {}", format_radio_config(&cfg));
+                ConfigSource::Ours
+            } else {
+                info!("[negotiate] get_config OK (differs from desired): {}", format_radio_config(&cfg));
+                ConfigSource::Mux
+            };
+            Ok((cfg, source))
+        }
+        Err(e) => {
+            info!("[negotiate] get_config FAILED: {e:#}");
+            // No config on radio — try to set ours.
+            info!("[negotiate] trying set_config...");
+            match client.set_config(*desired) {
+                Ok(()) => {
+                    info!("[negotiate] set_config OK");
+                    Ok((*desired, ConfigSource::Ours))
+                }
+                Err(e2) => {
+                    info!("[negotiate] set_config FAILED: {e2:#}");
+                    anyhow::bail!("GetConfig failed ({e:#}) and SetConfig also failed ({e2:#})");
+                }
+            }
+        }
+    }
+}
+
+/// Shorten a device path to just the filename for display.
+fn shorten_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn configs_match(a: &RadioConfig, b: &RadioConfig) -> bool {
+    a.freq_hz == b.freq_hz
+        && a.bw == b.bw
+        && a.sf == b.sf
+        && a.cr == b.cr
+        && a.sync_word == b.sync_word
+        && a.tx_power_dbm == b.tx_power_dbm
+        && a.preamble_len == b.preamble_len
+        && a.cad == b.cad
+}
+
 fn is_timeout_error(e: &anyhow::Error) -> bool {
     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
         matches!(
@@ -191,25 +243,30 @@ fn is_timeout_error(e: &anyhow::Error) -> bool {
     }
 }
 
+/// Format a bandwidth value for display.
+pub fn format_bandwidth(bw: donglora_client::Bandwidth) -> &'static str {
+    match bw {
+        donglora_client::Bandwidth::Khz7 => "7.8 kHz",
+        donglora_client::Bandwidth::Khz10 => "10.4 kHz",
+        donglora_client::Bandwidth::Khz15 => "15.6 kHz",
+        donglora_client::Bandwidth::Khz20 => "20.8 kHz",
+        donglora_client::Bandwidth::Khz31 => "31.25 kHz",
+        donglora_client::Bandwidth::Khz41 => "41.7 kHz",
+        donglora_client::Bandwidth::Khz62 => "62.5 kHz",
+        donglora_client::Bandwidth::Khz125 => "125 kHz",
+        donglora_client::Bandwidth::Khz250 => "250 kHz",
+        donglora_client::Bandwidth::Khz500 => "500 kHz",
+    }
+}
+
 /// Format a RadioConfig for display.
 pub fn format_radio_config(config: &RadioConfig) -> String {
     let freq_mhz = config.freq_hz as f64 / 1_000_000.0;
-    let bw = match config.bw {
-        donglora_client::Bandwidth::Khz7 => "7.8kHz",
-        donglora_client::Bandwidth::Khz10 => "10.4kHz",
-        donglora_client::Bandwidth::Khz15 => "15.6kHz",
-        donglora_client::Bandwidth::Khz20 => "20.8kHz",
-        donglora_client::Bandwidth::Khz31 => "31.25kHz",
-        donglora_client::Bandwidth::Khz41 => "41.7kHz",
-        donglora_client::Bandwidth::Khz62 => "62.5kHz",
-        donglora_client::Bandwidth::Khz125 => "125kHz",
-        donglora_client::Bandwidth::Khz250 => "250kHz",
-        donglora_client::Bandwidth::Khz500 => "500kHz",
-    };
+    let bw = format_bandwidth(config.bw);
     let power = if config.tx_power_dbm == donglora_client::TX_POWER_MAX {
         "max".to_string()
     } else {
-        format!("{}dBm", config.tx_power_dbm)
+        format!("{} dBm", config.tx_power_dbm)
     };
     let preamble = if config.preamble_len == 0 {
         16

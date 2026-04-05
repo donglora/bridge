@@ -6,15 +6,18 @@ use iroh::PublicKey;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::network::NetworkEvent;
-use crate::packet::{Envelope, RadioPacket, content_hash};
-use crate::radio::{ConfigSource, RadioEvent, format_radio_config};
+use crate::gossip::GossipEvent;
+use crate::packet::{GossipFrame, content_hash};
+use crate::radio::{ConfigSource, RadioEvent};
+use crate::rate_limit::RateLimiter;
 
 /// Active radio config info, sent to the TUI via watch channel.
 #[derive(Debug, Clone)]
 pub struct RadioConfigInfo {
-    pub config_str: String,
+    pub active: donglora_client::RadioConfig,
+    pub requested: donglora_client::RadioConfig,
     pub source: ConfigSource,
+    pub device: String,
 }
 
 /// Packet event for the TUI log.
@@ -25,7 +28,6 @@ pub struct PacketLogEntry {
     pub size: usize,
     pub snr: Option<i16>,
     pub rssi: Option<i16>,
-    pub peer_name: Option<String>,
     pub action: PacketAction,
 }
 
@@ -33,7 +35,7 @@ pub struct PacketLogEntry {
 pub enum PacketDirection {
     RadioRx,
     RadioTx,
-    NetRx,
+    GossipRx,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +44,7 @@ pub enum PacketAction {
     Transmitted,
     DroppedDedup,
     DroppedQueueFull,
+    DroppedRateLimit,
 }
 
 impl std::fmt::Display for PacketDirection {
@@ -49,7 +52,7 @@ impl std::fmt::Display for PacketDirection {
         match self {
             Self::RadioRx => write!(f, "RX "),
             Self::RadioTx => write!(f, "TX "),
-            Self::NetRx => write!(f, "NET"),
+            Self::GossipRx => write!(f, "GSP"),
         }
     }
 }
@@ -61,6 +64,7 @@ impl std::fmt::Display for PacketAction {
             Self::Transmitted => write!(f, "TX"),
             Self::DroppedDedup => write!(f, "DUP"),
             Self::DroppedQueueFull => write!(f, "FULL"),
+            Self::DroppedRateLimit => write!(f, "RATE"),
         }
     }
 }
@@ -70,10 +74,12 @@ impl std::fmt::Display for PacketAction {
 pub struct Stats {
     pub radio_rx: AtomicU64,
     pub radio_tx: AtomicU64,
-    pub forwarded: AtomicU64,
-    pub dropped_snr: AtomicU64,
-    pub dropped_dedup: AtomicU64,
+    pub gossip_rx: AtomicU64,
+    pub gossip_tx: AtomicU64,
+    pub dedup_hits: AtomicU64,
+    pub rate_limit_drops: AtomicU64,
     pub dropped_queue: AtomicU64,
+    pub neighbor_count: AtomicU64,
     pub radio_connected: AtomicU64, // 0 = disconnected, 1 = connected
 }
 
@@ -82,10 +88,12 @@ impl Stats {
         StatsSnapshot {
             radio_rx: self.radio_rx.load(Ordering::Relaxed),
             radio_tx: self.radio_tx.load(Ordering::Relaxed),
-            forwarded: self.forwarded.load(Ordering::Relaxed),
-            dropped_snr: self.dropped_snr.load(Ordering::Relaxed),
-            dropped_dedup: self.dropped_dedup.load(Ordering::Relaxed),
+            gossip_rx: self.gossip_rx.load(Ordering::Relaxed),
+            gossip_tx: self.gossip_tx.load(Ordering::Relaxed),
+            dedup_hits: self.dedup_hits.load(Ordering::Relaxed),
+            rate_limit_drops: self.rate_limit_drops.load(Ordering::Relaxed),
             dropped_queue: self.dropped_queue.load(Ordering::Relaxed),
+            neighbor_count: self.neighbor_count.load(Ordering::Relaxed),
             radio_connected: self.radio_connected.load(Ordering::Relaxed) != 0,
         }
     }
@@ -95,20 +103,22 @@ impl Stats {
 pub struct StatsSnapshot {
     pub radio_rx: u64,
     pub radio_tx: u64,
-    pub forwarded: u64,
-    pub dropped_snr: u64,
-    pub dropped_dedup: u64,
+    pub gossip_rx: u64,
+    pub gossip_tx: u64,
+    pub dedup_hits: u64,
+    pub rate_limit_drops: u64,
     pub dropped_queue: u64,
+    pub neighbor_count: u64,
     pub radio_connected: bool,
 }
 
 /// Time-bounded dedup cache.
-struct DedupCache<K: std::hash::Hash + Eq> {
-    entries: HashMap<K, Instant>,
+struct DedupCache {
+    entries: HashMap<[u8; 32], Instant>,
     ttl: Duration,
 }
 
-impl<K: std::hash::Hash + Eq> DedupCache<K> {
+impl DedupCache {
     fn new(ttl: Duration) -> Self {
         Self {
             entries: HashMap::new(),
@@ -117,78 +127,97 @@ impl<K: std::hash::Hash + Eq> DedupCache<K> {
     }
 
     /// Returns true if the key was already present (i.e., duplicate).
-    fn check_and_insert(&mut self, key: K) -> bool {
+    fn check_and_insert(&mut self, key: [u8; 32]) -> bool {
         let now = Instant::now();
-        self.prune(now);
-        if self.entries.contains_key(&key) {
+        if let Some(ts) = self.entries.get(&key)
+            && now.duration_since(*ts) < self.ttl
+        {
             return true;
         }
         self.entries.insert(key, now);
         false
     }
 
-    fn insert(&mut self, key: K) {
-        self.entries.insert(key, Instant::now());
-    }
-
-    fn prune(&mut self, now: Instant) {
+    fn prune(&mut self) {
+        let now = Instant::now();
         self.entries.retain(|_, ts| now.duration_since(*ts) < self.ttl);
-    }
-}
-
-/// Peer name lookup for log entries.
-struct PeerNames {
-    names: HashMap<PublicKey, String>,
-}
-
-impl PeerNames {
-    fn get(&self, pk: &PublicKey) -> Option<String> {
-        self.names.get(pk).cloned()
     }
 }
 
 /// Run the router — the central packet bus.
 ///
-/// This is an async task that mediates between the radio thread, the iroh
-/// network layer, and the TUI.
+/// Bridges radio packets to/from the gossip swarm with deduplication and rate limiting.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     our_id: PublicKey,
     dedup_window: Duration,
     tx_queue_size: usize,
-    peer_names: HashMap<PublicKey, String>,
+    requested_radio_config: donglora_client::RadioConfig,
+    mut rate_limiter: RateLimiter,
     mut radio_rx: mpsc::Receiver<RadioEvent>,
     radio_tx: mpsc::Sender<Vec<u8>>,
-    mut net_rx: mpsc::Receiver<NetworkEvent>,
-    net_tx: mpsc::Sender<(Envelope, Option<PublicKey>)>,
+    mut gossip_rx: mpsc::Receiver<GossipEvent>,
+    gossip_tx: mpsc::Sender<GossipFrame>,
     stats: &Stats,
     log_tx: mpsc::Sender<PacketLogEntry>,
     config_tx: tokio::sync::watch::Sender<RadioConfigInfo>,
 ) {
-    let names = PeerNames { names: peer_names };
-    let mut seq: u64 = 0;
-    let mut iroh_dedup: DedupCache<(PublicKey, u64)> = DedupCache::new(dedup_window);
-    let mut echo_dedup: DedupCache<[u8; 16]> = DedupCache::new(dedup_window);
+    let mut dedup = DedupCache::new(dedup_window);
     let mut tx_queue: VecDeque<Vec<u8>> = VecDeque::with_capacity(tx_queue_size);
+    let mut last_cleanup = Instant::now();
+    let cleanup_interval = Duration::from_secs(30);
 
     loop {
+        // Periodic dedup cleanup.
+        if last_cleanup.elapsed() >= cleanup_interval {
+            dedup.prune();
+            last_cleanup = Instant::now();
+        }
+
         tokio::select! {
             // Radio events.
             event = radio_rx.recv() => {
                 let Some(event) = event else { break };
                 match event {
                     RadioEvent::Packet(pkt) => {
-                        handle_radio_packet(
-                            &our_id, &mut seq, &pkt,
-                            &mut echo_dedup, &net_tx,
-                            stats, &log_tx, &names,
-                        ).await;
+                        stats.radio_rx.fetch_add(1, Ordering::Relaxed);
+
+                        let hash = content_hash(&pkt.payload);
+                        if dedup.check_and_insert(hash) {
+                            stats.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                            debug!("radio RX dedup suppressed ({} bytes)", pkt.payload.len());
+                            let _ = log_tx.send(PacketLogEntry {
+                                timestamp: Instant::now(),
+                                direction: PacketDirection::RadioRx,
+                                size: pkt.payload.len(),
+                                snr: Some(pkt.snr),
+                                rssi: Some(pkt.rssi),
+                                action: PacketAction::DroppedDedup,
+                            }).await;
+                            continue;
+                        }
+
+                        // Wrap and broadcast to gossip.
+                        let frame = GossipFrame::new(&our_id, pkt.rssi, pkt.snr, pkt.payload.clone());
+                        stats.gossip_tx.fetch_add(1, Ordering::Relaxed);
+                        let _ = gossip_tx.send(frame).await;
+
+                        let _ = log_tx.send(PacketLogEntry {
+                            timestamp: Instant::now(),
+                            direction: PacketDirection::RadioRx,
+                            size: pkt.payload.len(),
+                            snr: Some(pkt.snr),
+                            rssi: Some(pkt.rssi),
+                            action: PacketAction::Forwarded,
+                        }).await;
                     }
-                    RadioEvent::Connected(active_config, source) => {
+                    RadioEvent::Connected(active_config, source, device) => {
                         stats.radio_connected.store(1, Ordering::Relaxed);
                         let _ = config_tx.send(RadioConfigInfo {
-                            config_str: format_radio_config(&active_config),
+                            active: active_config,
+                            requested: requested_radio_config,
                             source,
+                            device,
                         });
                     }
                     RadioEvent::Disconnected => {
@@ -197,19 +226,70 @@ pub async fn run(
                 }
             }
 
-            // Network events.
-            event = net_rx.recv() => {
+            // Gossip events.
+            event = gossip_rx.recv() => {
                 let Some(event) = event else { break };
                 match event {
-                    NetworkEvent::Packet { from, envelope } => {
-                        handle_net_packet(
-                            &from, envelope, &mut iroh_dedup, &mut echo_dedup,
-                            &mut tx_queue, tx_queue_size,
-                            stats, &log_tx, &names,
-                        ).await;
+                    GossipEvent::Frame(frame) => {
+                        stats.gossip_rx.fetch_add(1, Ordering::Relaxed);
+
+                        let hash = content_hash(&frame.payload);
+                        if dedup.check_and_insert(hash) {
+                            stats.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                            debug!("gossip RX dedup suppressed ({} bytes)", frame.payload.len());
+                            let _ = log_tx.send(PacketLogEntry {
+                                timestamp: Instant::now(),
+                                direction: PacketDirection::GossipRx,
+                                size: frame.payload.len(),
+                                snr: Some(frame.snr),
+                                rssi: Some(frame.rssi),
+                                action: PacketAction::DroppedDedup,
+                            }).await;
+                            continue;
+                        }
+
+                        // Rate limit check.
+                        if !rate_limiter.try_acquire() {
+                            stats.rate_limit_drops.fetch_add(1, Ordering::Relaxed);
+                            debug!("rate limited ({} bytes)", frame.payload.len());
+                            let _ = log_tx.send(PacketLogEntry {
+                                timestamp: Instant::now(),
+                                direction: PacketDirection::GossipRx,
+                                size: frame.payload.len(),
+                                snr: Some(frame.snr),
+                                rssi: Some(frame.rssi),
+                                action: PacketAction::DroppedRateLimit,
+                            }).await;
+                            continue;
+                        }
+
+                        // Enqueue for radio TX.
+                        if tx_queue.len() >= tx_queue_size {
+                            stats.dropped_queue.fetch_add(1, Ordering::Relaxed);
+                            warn!("TX queue full, dropping packet ({} bytes)", frame.payload.len());
+                            let _ = log_tx.send(PacketLogEntry {
+                                timestamp: Instant::now(),
+                                direction: PacketDirection::GossipRx,
+                                size: frame.payload.len(),
+                                snr: Some(frame.snr),
+                                rssi: Some(frame.rssi),
+                                action: PacketAction::DroppedQueueFull,
+                            }).await;
+                            continue;
+                        }
+
+                        tx_queue.push_back(frame.payload.clone());
+                        let _ = log_tx.send(PacketLogEntry {
+                            timestamp: Instant::now(),
+                            direction: PacketDirection::GossipRx,
+                            size: frame.payload.len(),
+                            snr: Some(frame.snr),
+                            rssi: Some(frame.rssi),
+                            action: PacketAction::Transmitted,
+                        }).await;
                     }
-                    NetworkEvent::PeerConnected(_) | NetworkEvent::PeerDisconnected(_) => {
-                        // State tracked in network layer; TUI reads from there.
+                    GossipEvent::NeighborChanged(count) => {
+                        stats.neighbor_count.store(count as u64, Ordering::Relaxed);
                     }
                 }
             }
@@ -226,7 +306,6 @@ pub async fn run(
                     size,
                     snr: None,
                     rssi: None,
-                    peer_name: None,
                     action: PacketAction::Transmitted,
                 })
                 .await;
@@ -234,137 +313,5 @@ pub async fn run(
                 break;
             }
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_radio_packet(
-    our_id: &PublicKey,
-    seq: &mut u64,
-    pkt: &RadioPacket,
-    echo_dedup: &mut DedupCache<[u8; 16]>,
-    net_tx: &mpsc::Sender<(Envelope, Option<PublicKey>)>,
-    stats: &Stats,
-    log_tx: &mpsc::Sender<PacketLogEntry>,
-    names: &PeerNames,
-) {
-    stats.radio_rx.fetch_add(1, Ordering::Relaxed);
-
-    // Check echo suppression.
-    let hash = content_hash(&pkt.payload);
-    if echo_dedup.check_and_insert(hash) {
-        stats.dropped_dedup.fetch_add(1, Ordering::Relaxed);
-        debug!("radio RX echo suppressed ({} bytes)", pkt.payload.len());
-        let _ = log_tx
-            .send(PacketLogEntry {
-                timestamp: Instant::now(),
-                direction: PacketDirection::RadioRx,
-                size: pkt.payload.len(),
-                snr: Some(pkt.snr),
-                rssi: Some(pkt.rssi),
-                peer_name: None,
-                action: PacketAction::DroppedDedup,
-            })
-            .await;
-        return;
-    }
-
-    // Wrap and forward to all peers.
-    *seq += 1;
-    let envelope = Envelope {
-        origin: *our_id,
-        seq: *seq,
-        rssi: pkt.rssi,
-        snr: pkt.snr,
-        payload: pkt.payload.clone(),
-    };
-
-    stats.forwarded.fetch_add(1, Ordering::Relaxed);
-    let _ = net_tx.send((envelope, None)).await;
-    let _ = log_tx
-        .send(PacketLogEntry {
-            timestamp: Instant::now(),
-            direction: PacketDirection::RadioRx,
-            size: pkt.payload.len(),
-            snr: Some(pkt.snr),
-            rssi: Some(pkt.rssi),
-            peer_name: names.get(our_id),
-            action: PacketAction::Forwarded,
-        })
-        .await;
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_net_packet(
-    from: &PublicKey,
-    envelope: Envelope,
-    iroh_dedup: &mut DedupCache<(PublicKey, u64)>,
-    echo_dedup: &mut DedupCache<[u8; 16]>,
-    tx_queue: &mut VecDeque<Vec<u8>>,
-    tx_queue_size: usize,
-    stats: &Stats,
-    log_tx: &mpsc::Sender<PacketLogEntry>,
-    names: &PeerNames,
-) {
-    // Check iroh-level dedup.
-    if iroh_dedup.check_and_insert((envelope.origin, envelope.seq)) {
-        stats.dropped_dedup.fetch_add(1, Ordering::Relaxed);
-        debug!("net dedup ({} bytes from {})", envelope.payload.len(), fmt_key(from));
-        let _ = log_tx
-            .send(PacketLogEntry {
-                timestamp: Instant::now(),
-                direction: PacketDirection::NetRx,
-                size: envelope.payload.len(),
-                snr: Some(envelope.snr),
-                rssi: Some(envelope.rssi),
-                peer_name: names.get(from),
-                action: PacketAction::DroppedDedup,
-            })
-            .await;
-        return;
-    }
-
-    // Insert content hash for radio echo suppression.
-    let hash = content_hash(&envelope.payload);
-    echo_dedup.insert(hash);
-
-    // Enqueue for radio TX.
-    if tx_queue.len() >= tx_queue_size {
-        stats.dropped_queue.fetch_add(1, Ordering::Relaxed);
-        warn!("TX queue full, dropping packet ({} bytes)", envelope.payload.len());
-        let _ = log_tx
-            .send(PacketLogEntry {
-                timestamp: Instant::now(),
-                direction: PacketDirection::NetRx,
-                size: envelope.payload.len(),
-                snr: Some(envelope.snr),
-                rssi: Some(envelope.rssi),
-                peer_name: names.get(from),
-                action: PacketAction::DroppedQueueFull,
-            })
-            .await;
-        return;
-    }
-
-    tx_queue.push_back(envelope.payload);
-    let _ = log_tx
-        .send(PacketLogEntry {
-            timestamp: Instant::now(),
-            direction: PacketDirection::NetRx,
-            size: tx_queue.back().map(Vec::len).unwrap_or(0),
-            snr: Some(envelope.snr),
-            rssi: Some(envelope.rssi),
-            peer_name: names.get(from),
-            action: PacketAction::Transmitted,
-        })
-        .await;
-}
-
-fn fmt_key(pk: &PublicKey) -> String {
-    let s = pk.to_string();
-    if s.len() > 12 {
-        format!("{}...", &s[..12])
-    } else {
-        s
     }
 }
