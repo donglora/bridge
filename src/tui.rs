@@ -23,8 +23,8 @@ use crate::router::{PacketAction, PacketDirection, PacketLogEntry, RadioConfigIn
 
 const TICK_RATE: Duration = Duration::from_millis(250);
 const MAX_LOG_ENTRIES: usize = 200;
-const BUCKET_SECS: u64 = 10;
-const MAX_BUCKETS: usize = 60;
+const BUCKET_SECS: u64 = 1;
+const MAX_BUCKETS: usize = 300;
 
 // ── Color palette (consistent across panels) ─────────────────────
 
@@ -202,7 +202,11 @@ async fn tui_loop(
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Char('q')
+            && matches!(
+                (key.code, key.modifiers),
+                (KeyCode::Char('q'), _)
+                    | (KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL)
+            )
         {
             cancel.cancel();
             return Ok(());
@@ -226,18 +230,22 @@ fn draw_ui(
     start_time: Instant,
     series: &TimeSeries,
 ) {
-    let outer = Layout::default()
+    // Header row + body.
+    let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
 
-    draw_header(frame, outer[0], stats);
+    draw_header(frame, rows[0], stats);
 
+    // Body: 3 columns — left panels | packet log (fixed) | activity charts (fill).
+    // Packet log columns: Age=5 Hash=8 RF=4 Net=4 Size=6 RSSI=6 SNR=5 Act=5 = 43 + 2 border + 1 pad = 46
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(40)])
-        .split(outer[1]);
+        .constraints([Constraint::Length(30), Constraint::Length(46), Constraint::Min(10)])
+        .split(rows[1]);
 
+    // Left column: Network, Radio, Stats stacked.
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -251,23 +259,35 @@ fn draw_ui(
     draw_radio(frame, left[1], config_info);
     draw_stats(frame, left[2], stats, start_time);
     draw_log(frame, cols[1], log_entries);
-    draw_activity(frame, outer[2], series);
+    draw_activity(frame, cols[2], series);
 }
 
 // ── Header ───────────────────────────────────────────────────────
 
 fn draw_header(frame: &mut ratatui::Frame, area: Rect, stats: &StatsSnapshot) {
-    let now = chrono_time();
-    let line = Line::from(vec![
-        Span::styled(" donglora-bridge ", Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD)),
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(14), // pills
+            Constraint::Min(0),    // fill
+        ])
+        .split(area);
+
+    // Left: status pills.
+    let pills = Line::from(vec![
+        Span::raw(" "),
         status_pill("RADIO", stats.radio_connected),
         Span::raw(" "),
         status_pill("NET", stats.neighbor_count > 0),
-        Span::raw("  "),
-        Span::styled(now, Style::default().fg(C_LABEL)),
-        Span::styled("  q=quit", Style::default().fg(C_LABEL)),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(pills), cols[0]);
+
+    // Right: clock with timezone.
+    let clock = Line::from(Span::styled(
+        format!("{} ", chrono_time()),
+        Style::default().fg(C_LABEL),
+    ));
+    frame.render_widget(Paragraph::new(clock).alignment(Alignment::Right), cols[1]);
 }
 
 fn status_pill(label: &str, ok: bool) -> Span<'static> {
@@ -307,11 +327,28 @@ fn draw_network(frame: &mut ratatui::Frame, area: Rect, state: &crate::gossip::S
 // ── Radio panel ──────────────────────────────────────────────────
 
 fn draw_radio(frame: &mut ratatui::Frame, area: Rect, config_info: &RadioConfigInfo) {
+    let connected = config_info.connected;
     let is_mux = matches!(config_info.source, ConfigSource::Mux);
-    let border_color = if is_mux { C_RATE_DROP } else { C_BORDER };
+
+    let border_color = if !connected {
+        C_QUEUE_DROP
+    } else if is_mux {
+        C_RATE_DROP
+    } else {
+        C_BORDER
+    };
+
+    let title = if !connected {
+        " Radio (disconnected) "
+    } else if is_mux {
+        " Radio (mux) "
+    } else {
+        " Radio "
+    };
+
     let block = Block::default()
         .title(Span::styled(
-            if is_mux { " Radio (mux) " } else { " Radio " },
+            title,
             Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -330,15 +367,23 @@ fn draw_radio(frame: &mut ratatui::Frame, area: Rect, config_info: &RadioConfigI
     let preamble = if a.preamble_len == 0 { 16 } else { a.preamble_len };
     let cad = if a.cad != 0 { "on" } else { "off" };
 
+    // Dim values when disconnected; highlight mux mismatches when connected.
+    let val_color = if connected { C_ACCENT } else { C_LABEL };
     let cf = |label: &str, value: String, matches: bool| -> Line<'static> {
-        let color = if !is_mux || matches { C_ACCENT } else { C_RATE_DROP };
-        let mark = if is_mux && !matches { " !" } else { "" };
+        let color = if !connected {
+            C_LABEL
+        } else if !is_mux || matches {
+            C_ACCENT
+        } else {
+            C_RATE_DROP
+        };
+        let mark = if connected && is_mux && !matches { " !" } else { "" };
         kv_line(label, &format!("{value}{mark}"), color)
     };
 
     let dev = if config_info.device.is_empty() { "-" } else { &config_info.device };
     let lines = vec![
-        kv_line("Device", dev, C_ACCENT),
+        kv_line("Device", dev, val_color),
         cf("Freq", format!("{freq_mhz:.3} MHz"), a.freq_hz == r.freq_hz),
         cf("BW", bw_str.to_string(), a.bw == r.bw),
         cf("SF", format!("{}", a.sf), a.sf == r.sf),
@@ -392,41 +437,59 @@ fn draw_log(frame: &mut ratatui::Frame, area: Rect, entries: &[PacketLogEntry]) 
     let start = entries.len().saturating_sub(data_height);
     let visible = &entries[start..];
 
-    // Column header with underline effect via bold.
+    // Fixed column widths: Age=5 Hash=8 RF=4 Net=4 Size=6 RSSI=6 SNR=5 Act=5
+    // Every span (header and data) uses the same width per column.
+    let hdr = Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD);
     let header = Line::from(vec![
-        Span::styled("  Age", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD)),
-        Span::styled("   RF", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD)),
-        Span::styled("  Net", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD)),
-        Span::styled("  Size", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD)),
-        Span::styled("  RSSI", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD)),
-        Span::styled("  SNR", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD)),
-        Span::styled("  Act", Style::default().fg(C_LABEL).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:>5}", "Age"), hdr),
+        Span::styled(format!("{:>8}", "Hash"), hdr),
+        Span::styled(format!("{:>4}", "RF"), hdr),
+        Span::styled(format!("{:>4}", "Net"), hdr),
+        Span::styled(format!("{:>6}", "Size"), hdr),
+        Span::styled(format!("{:>6}", "RSSI"), hdr),
+        Span::styled(format!("{:>5}", "SNR"), hdr),
+        Span::styled(format!("{:>5}", "Act"), hdr),
     ]);
 
     let mut lines = vec![header];
+    let mut prev_hash: Option<[u8; 32]> = None;
 
     for e in visible {
         let age = format_short_duration(e.timestamp.elapsed());
+        let bridged = matches!(e.action, PacketAction::Bridged);
 
-        let dash = "  ───";
+        // Show short hash, or ellipsis if same as previous line.
+        let hash_span = if prev_hash == Some(e.hash) {
+            Span::styled(format!("{:>8}", "··"), Style::default().fg(C_BORDER))
+        } else {
+            Span::styled(format!("{:>8}", hex::encode(&e.hash[..3])), Style::default().fg(C_LABEL))
+        };
+        prev_hash = Some(e.hash);
+
+        // Each row shows both columns. Bridged packets light up both sides.
+        // Dropped packets only show the input side.
+        let dash = Span::styled(format!("{:>4}", "──"), Style::default().fg(C_BORDER));
         let (rf_col, net_col) = match e.direction {
-            PacketDirection::RadioRx => (
-                Span::styled("   RX", Style::default().fg(C_RADIO_RX)),
-                Span::styled(dash, Style::default().fg(C_BORDER)),
+            PacketDirection::RadioIn => (
+                Span::styled(format!("{:>4}", "RX"), Style::default().fg(C_RADIO_RX)),
+                if bridged {
+                    Span::styled(format!("{:>4}", "TX"), Style::default().fg(C_NET_TX))
+                } else {
+                    dash
+                },
             ),
-            PacketDirection::RadioTx => (
-                Span::styled("   TX", Style::default().fg(C_RADIO_TX)),
-                Span::styled(dash, Style::default().fg(C_BORDER)),
-            ),
-            PacketDirection::GossipRx => (
-                Span::styled(dash, Style::default().fg(C_BORDER)),
-                Span::styled("   RX", Style::default().fg(C_NET_RX)),
+            PacketDirection::GossipIn => (
+                if bridged {
+                    Span::styled(format!("{:>4}", "TX"), Style::default().fg(C_RADIO_TX))
+                } else {
+                    dash
+                },
+                Span::styled(format!("{:>4}", "RX"), Style::default().fg(C_NET_RX)),
             ),
         };
 
         let action_color = match e.action {
-            PacketAction::Forwarded => C_NET_TX,
-            PacketAction::Transmitted => C_RADIO_TX,
+            PacketAction::Bridged => C_LABEL,
             PacketAction::DroppedDedup => C_DEDUP,
             PacketAction::DroppedQueueFull => C_QUEUE_DROP,
             PacketAction::DroppedRateLimit => C_RATE_DROP,
@@ -434,21 +497,31 @@ fn draw_log(frame: &mut ratatui::Frame, area: Rect, entries: &[PacketLogEntry]) 
 
         let rssi_span = match e.rssi {
             Some(r) => Span::styled(format!("{r:>6}"), Style::default().fg(rssi_color(r))),
-            None => Span::styled("     -", Style::default().fg(C_LABEL)),
+            None => Span::styled(format!("{:>6}", "-"), Style::default().fg(C_LABEL)),
         };
         let snr_span = match e.snr {
             Some(s) => Span::styled(format!("{s:>5}"), Style::default().fg(snr_color(s))),
-            None => Span::styled("    -", Style::default().fg(C_LABEL)),
+            None => Span::styled(format!("{:>5}", "-"), Style::default().fg(C_LABEL)),
         };
 
+        let action_str = match e.action {
+            PacketAction::Bridged => "",
+            PacketAction::DroppedDedup => "DUP",
+            PacketAction::DroppedQueueFull => "FULL",
+            PacketAction::DroppedRateLimit => "RATE",
+        };
+        let action_span = Span::styled(format!(" {:>4}", action_str), Style::default().fg(action_color));
+
+        let size_str = format!("{}B", e.size);
         lines.push(Line::from(vec![
-            Span::styled(format!(" {age:>3} "), Style::default().fg(C_LABEL)),
+            Span::styled(format!("{:>5}", age), Style::default().fg(C_LABEL)),
+            hash_span,
             rf_col,
             net_col,
-            Span::styled(format!("{:>5}B", e.size), Style::default().fg(C_VALUE)),
+            Span::styled(format!("{:>6}", size_str), Style::default().fg(C_VALUE)),
             rssi_span,
             snr_span,
-            Span::styled(format!("  {}", e.action), Style::default().fg(action_color)),
+            action_span,
         ]));
     }
 
@@ -458,11 +531,11 @@ fn draw_log(frame: &mut ratatui::Frame, area: Rect, entries: &[PacketLogEntry]) 
 // ── Activity chart ───────────────────────────────────────────────
 
 fn draw_activity(frame: &mut ratatui::Frame, area: Rect, series: &TimeSeries) {
-    let block = panel_block(" Activity (10s buckets) ");
+    let block = panel_block(" Activity (1s) ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.height < 3 || inner.width < 20 {
+    if inner.height < 6 || inner.width < 6 {
         return;
     }
 
@@ -475,61 +548,53 @@ fn draw_activity(frame: &mut ratatui::Frame, area: Rect, series: &TimeSeries) {
         ])
         .split(inner);
 
-    let rx_data = series.radio_rx();
-    let tx_data = series.radio_tx();
-    let snr_data = series.avg_snr();
+    let spark_w = inner.width as usize;
 
-    let label_w = 12u16;
-    let spark_w = inner.width.saturating_sub(label_w) as usize;
+    let rx_data = pad_right_align(&series.radio_rx(), spark_w);
+    let tx_data = pad_right_align(&series.radio_tx(), spark_w);
+    let snr_data = pad_right_align(&series.avg_snr(), spark_w);
 
     let peak_rx = series.peak_rx();
     let peak_tx = series.peak_tx();
     let snr_label = series
         .latest_avg_snr()
-        .map(|s| format!("avg:{s}dB"))
+        .map(|s| format!("{s}dB"))
         .unwrap_or_else(|| "-".into());
 
-    let rx_padded = pad_right_align(&rx_data, spark_w);
-    let tx_padded = pad_right_align(&tx_data, spark_w);
-    let snr_padded = pad_right_align(&snr_data, spark_w);
-
-    draw_sparkline_row(frame, rows[0], "RF RX", &format!("pk:{peak_rx}"), &rx_padded, C_RADIO_RX, label_w);
-    draw_sparkline_row(frame, rows[1], "RF TX", &format!("pk:{peak_tx}"), &tx_padded, C_RADIO_TX, label_w);
-    draw_sparkline_row(frame, rows[2], "SNR", &snr_label, &snr_padded, C_SNR, label_w);
+    draw_sparkline_section(frame, rows[0], "RX", &format!("pk:{peak_rx}"), &rx_data, C_RADIO_RX);
+    draw_sparkline_section(frame, rows[1], "TX", &format!("pk:{peak_tx}"), &tx_data, C_RADIO_TX);
+    draw_sparkline_section(frame, rows[2], "SNR", &snr_label, &snr_data, C_SNR);
 }
 
-fn draw_sparkline_row(
+/// Draw a label line on top, sparkline filling the rest below.
+fn draw_sparkline_section(
     frame: &mut ratatui::Frame,
     area: Rect,
     label: &str,
     detail: &str,
     data: &[u64],
     color: Color,
-    label_width: u16,
 ) {
-    if area.width < label_width + 5 || area.height < 1 {
+    if area.height < 2 || area.width < 4 {
         return;
     }
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(label_width), Constraint::Min(1)])
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
 
-    // Label + detail stacked if room, otherwise just label.
-    let mut label_lines = vec![
-        Line::from(Span::styled(format!(" {label}"), Style::default().fg(color).add_modifier(Modifier::BOLD))),
-    ];
-    if cols[0].height > 1 {
-        label_lines.push(Line::from(Span::styled(format!(" {detail}"), Style::default().fg(C_LABEL))));
-    }
-    frame.render_widget(Paragraph::new(label_lines), cols[0]);
+    let label_line = Line::from(vec![
+        Span::styled(format!(" {label} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(detail.to_string(), Style::default().fg(C_LABEL)),
+    ]);
+    frame.render_widget(Paragraph::new(label_line), rows[0]);
 
     let spark = Sparkline::default()
         .data(data)
         .bar_set(symbols::bar::NINE_LEVELS)
         .style(Style::default().fg(color));
-    frame.render_widget(spark, cols[1]);
+    frame.render_widget(spark, rows[1]);
 }
 
 /// Pad data with leading zeros so values are right-aligned in `width` columns.
@@ -609,8 +674,5 @@ fn format_short_duration(d: Duration) -> String {
 }
 
 fn chrono_time() -> String {
-    let now = std::time::SystemTime::now();
-    let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let secs = since_epoch.as_secs();
-    format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs % 3600) / 60, secs % 60)
+    jiff::Zoned::now().strftime("%H:%M:%S %Z").to_string()
 }

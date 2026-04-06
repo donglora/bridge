@@ -50,10 +50,12 @@ fn radio_loop(
     event_tx: mpsc::Sender<RadioEvent>,
     mut tx_recv: mpsc::Receiver<Vec<u8>>,
 ) {
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
+    let initial_backoff = Duration::from_millis(250);
+    let max_backoff = Duration::from_secs(5);
+    let mut backoff = initial_backoff;
 
     loop {
+        let started = std::time::Instant::now();
         match connect_and_run(&config, &port, &event_tx, &mut tx_recv) {
             Ok(()) => {
                 info!("radio thread exiting");
@@ -62,6 +64,13 @@ fn radio_loop(
             Err(e) => {
                 error!("radio error: {e:#}");
                 let _ = event_tx.blocking_send(RadioEvent::Disconnected);
+
+                // If we were connected for a while, reset backoff so
+                // the next reconnect attempt is fast.
+                if started.elapsed() > Duration::from_secs(5) {
+                    backoff = initial_backoff;
+                }
+
                 info!("reconnecting in {backoff:?}");
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(max_backoff);
@@ -85,7 +94,7 @@ fn connect_and_run(
         let c = donglora_client::connect(Some(port), timeout)?;
         (c, shorten_path(port))
     } else {
-        let c = donglora_client::connect_default()?;
+        let c = donglora_client::connect_mux_auto(timeout)?;
         (c, "mux".to_string())
     };
     info!("[radio] transport connected: {device}");
@@ -128,18 +137,26 @@ fn connect_and_run(
         .set_timeout(Duration::from_millis(100))?;
     info!("[radio] entering main loop");
 
+    // Liveness: ping the mux periodically when idle to detect a dead connection.
+    // Without this, a killed mux causes recv() to silently return Ok(None) forever.
+    let liveness_interval = Duration::from_secs(2);
+    let mut last_activity = std::time::Instant::now();
+
     loop {
         // Check for TX requests (non-blocking).
         while let Ok(payload) = tx_recv.try_recv() {
             debug!("TX {} bytes", payload.len());
             if let Err(e) = client.transmit(&payload, None) {
                 warn!("transmit error: {e:#}");
+                return Err(e);
             }
+            last_activity = std::time::Instant::now();
         }
 
         // Check for RX packets.
         match client.recv() {
             Ok(Some(Response::RxPacket { rssi, snr, payload })) => {
+                last_activity = std::time::Instant::now();
                 let grade = snr_grade(snr, active_config.sf);
                 if grade.should_forward() {
                     debug!(
@@ -157,10 +174,29 @@ fn connect_and_run(
                     );
                 }
             }
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                last_activity = std::time::Instant::now();
+            }
             Ok(None) => {}
             Err(e) if is_timeout_error(&e) => {}
             Err(e) => return Err(e),
+        }
+
+        // Liveness check: if no real activity for a while, ping the mux.
+        if last_activity.elapsed() >= liveness_interval {
+            // Temporarily extend the timeout for the ping command.
+            let _ = client.transport_mut().set_timeout(Duration::from_secs(2));
+            match client.ping() {
+                Ok(()) => {
+                    last_activity = std::time::Instant::now();
+                }
+                Err(e) => {
+                    warn!("liveness ping failed: {e:#}");
+                    return Err(e);
+                }
+            }
+            // Restore the short timeout.
+            let _ = client.transport_mut().set_timeout(Duration::from_millis(100));
         }
 
         if event_tx.is_closed() {

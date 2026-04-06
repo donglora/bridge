@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
             requested: radio_config,
             source: radio::ConfigSource::Ours,
             device: String::new(),
+            connected: false,
         },
     );
 
@@ -175,18 +176,25 @@ async fn main() -> Result<()> {
         router_cancel.cancel();
     });
 
+    // Spawn a task that cancels on ctrl-c or SIGTERM.
+    {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ).expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
+                _ = sigterm.recv() => info!("received SIGTERM"),
+            }
+            cancel.cancel();
+        });
+    }
+
     // Run TUI or headless.
     if cli.log_only {
         info!("running in headless mode");
-        tokio::select! {
-            () = cancel.cancelled() => {},
-            result = tokio::signal::ctrl_c() => {
-                if let Err(e) = result {
-                    tracing::error!("signal handler error: {e}");
-                }
-                info!("received ctrl-c, shutting down");
-            }
-        }
+        cancel.cancelled().await;
     } else {
         let terminal = tui::run(
             config_watch_rx,
@@ -210,7 +218,6 @@ async fn main() -> Result<()> {
     }
 
     // Shutdown (headless path).
-    cancel.cancel();
     swarm.shutdown().await;
     info!("donglora-bridge stopped");
 

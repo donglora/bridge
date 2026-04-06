@@ -18,12 +18,14 @@ pub struct RadioConfigInfo {
     pub requested: donglora_client::RadioConfig,
     pub source: ConfigSource,
     pub device: String,
+    pub connected: bool,
 }
 
 /// Packet event for the TUI log.
 #[derive(Debug, Clone)]
 pub struct PacketLogEntry {
     pub timestamp: Instant,
+    pub hash: [u8; 32],
     pub direction: PacketDirection,
     pub size: usize,
     pub snr: Option<i16>,
@@ -31,37 +33,32 @@ pub struct PacketLogEntry {
     pub action: PacketAction,
 }
 
+/// Which side the packet arrived from.
 #[derive(Debug, Clone, Copy)]
 pub enum PacketDirection {
-    RadioRx,
-    RadioTx,
-    GossipRx,
+    /// Heard on local radio → forwarded to gossip swarm.
+    RadioIn,
+    /// Received from gossip swarm → queued for radio TX.
+    GossipIn,
 }
 
+/// What happened to the packet.
 #[derive(Debug, Clone, Copy)]
 pub enum PacketAction {
-    Forwarded,
-    Transmitted,
+    /// Successfully bridged (radio→gossip or gossip→radio).
+    Bridged,
+    /// Dropped: duplicate payload.
     DroppedDedup,
+    /// Dropped: TX queue full.
     DroppedQueueFull,
+    /// Dropped: rate limiter.
     DroppedRateLimit,
-}
-
-impl std::fmt::Display for PacketDirection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RadioRx => write!(f, "RX "),
-            Self::RadioTx => write!(f, "TX "),
-            Self::GossipRx => write!(f, "GSP"),
-        }
-    }
 }
 
 impl std::fmt::Display for PacketAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Forwarded => write!(f, "FWD"),
-            Self::Transmitted => write!(f, "TX"),
+            Self::Bridged => write!(f, ""),
             Self::DroppedDedup => write!(f, "DUP"),
             Self::DroppedQueueFull => write!(f, "FULL"),
             Self::DroppedRateLimit => write!(f, "RATE"),
@@ -188,7 +185,8 @@ pub async fn run(
                             debug!("radio RX dedup suppressed ({} bytes)", pkt.payload.len());
                             let _ = log_tx.send(PacketLogEntry {
                                 timestamp: Instant::now(),
-                                direction: PacketDirection::RadioRx,
+                                hash,
+                                direction: PacketDirection::RadioIn,
                                 size: pkt.payload.len(),
                                 snr: Some(pkt.snr),
                                 rssi: Some(pkt.rssi),
@@ -204,11 +202,12 @@ pub async fn run(
 
                         let _ = log_tx.send(PacketLogEntry {
                             timestamp: Instant::now(),
-                            direction: PacketDirection::RadioRx,
+                            hash,
+                            direction: PacketDirection::RadioIn,
                             size: pkt.payload.len(),
                             snr: Some(pkt.snr),
                             rssi: Some(pkt.rssi),
-                            action: PacketAction::Forwarded,
+                            action: PacketAction::Bridged,
                         }).await;
                     }
                     RadioEvent::Connected(active_config, source, device) => {
@@ -218,10 +217,12 @@ pub async fn run(
                             requested: requested_radio_config,
                             source,
                             device,
+                            connected: true,
                         });
                     }
                     RadioEvent::Disconnected => {
                         stats.radio_connected.store(0, Ordering::Relaxed);
+                        config_tx.send_modify(|info| info.connected = false);
                     }
                 }
             }
@@ -239,7 +240,8 @@ pub async fn run(
                             debug!("gossip RX dedup suppressed ({} bytes)", frame.payload.len());
                             let _ = log_tx.send(PacketLogEntry {
                                 timestamp: Instant::now(),
-                                direction: PacketDirection::GossipRx,
+                                hash,
+                                direction: PacketDirection::GossipIn,
                                 size: frame.payload.len(),
                                 snr: Some(frame.snr),
                                 rssi: Some(frame.rssi),
@@ -254,7 +256,8 @@ pub async fn run(
                             debug!("rate limited ({} bytes)", frame.payload.len());
                             let _ = log_tx.send(PacketLogEntry {
                                 timestamp: Instant::now(),
-                                direction: PacketDirection::GossipRx,
+                                hash,
+                                direction: PacketDirection::GossipIn,
                                 size: frame.payload.len(),
                                 snr: Some(frame.snr),
                                 rssi: Some(frame.rssi),
@@ -269,7 +272,8 @@ pub async fn run(
                             warn!("TX queue full, dropping packet ({} bytes)", frame.payload.len());
                             let _ = log_tx.send(PacketLogEntry {
                                 timestamp: Instant::now(),
-                                direction: PacketDirection::GossipRx,
+                                hash,
+                                direction: PacketDirection::GossipIn,
                                 size: frame.payload.len(),
                                 snr: Some(frame.snr),
                                 rssi: Some(frame.rssi),
@@ -281,11 +285,12 @@ pub async fn run(
                         tx_queue.push_back(frame.payload.clone());
                         let _ = log_tx.send(PacketLogEntry {
                             timestamp: Instant::now(),
-                            direction: PacketDirection::GossipRx,
+                            hash,
+                            direction: PacketDirection::GossipIn,
                             size: frame.payload.len(),
                             snr: Some(frame.snr),
                             rssi: Some(frame.rssi),
-                            action: PacketAction::Transmitted,
+                            action: PacketAction::Bridged,
                         }).await;
                     }
                     GossipEvent::NeighborChanged(count) => {
@@ -297,18 +302,7 @@ pub async fn run(
 
         // Drain TX queue to radio.
         while let Some(payload) = tx_queue.pop_front() {
-            let size = payload.len();
             stats.radio_tx.fetch_add(1, Ordering::Relaxed);
-            let _ = log_tx
-                .send(PacketLogEntry {
-                    timestamp: Instant::now(),
-                    direction: PacketDirection::RadioTx,
-                    size,
-                    snr: None,
-                    rssi: None,
-                    action: PacketAction::Transmitted,
-                })
-                .await;
             if radio_tx.send(payload).await.is_err() {
                 break;
             }

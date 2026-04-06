@@ -29,6 +29,7 @@ rand = "0.9"
 hex = "0.4.3"
 sha2 = "0.10"
 tokio-util = { version = "0.7.18", features = ["rt"] }
+jiff = "0.2.23"
 
 [lints.clippy]
 unwrap_used = "deny"

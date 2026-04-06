@@ -361,12 +361,22 @@ fn spawn_broadcaster(
     });
 }
 
-/// Fast DHT interval while we have no neighbors.
-const DHT_FAST_INTERVAL_SECS: u64 = 5;
+/// DHT poll interval while alone (read frequently, publish infrequently).
+const DHT_ALONE_READ_SECS: u64 = 3;
 
-/// Periodically publish our peer list to the DHT and discover new peers.
+/// How often a lonely node publishes (merge-only, never destructive).
+/// Slower than reads — publishing is heavier and a lonely node only adds itself.
+const DHT_ALONE_PUBLISH_SECS: u64 = 30;
+
+/// Periodically interact with the DHT to discover and share peers.
 ///
-/// Interval is adaptive: fast (5s) while alone, slow (5 min) once connected.
+/// Strategy:
+/// - **Alone:** Read every 3s (cheap). Publish every 30s via merge — reads
+///   existing data first, appends ourselves, writes back. Two fresh nodes
+///   both doing this will eventually see each other. Never blindly overwrites.
+/// - **Connected:** Read + publish on relaxed 5-min schedule. We have
+///   valuable neighbor info to share.
+/// - **Transition to connected:** Publish immediately.
 #[allow(clippy::too_many_arguments)]
 fn spawn_dht_heartbeat(
     my_id: PublicKey,
@@ -388,47 +398,80 @@ fn spawn_dht_heartbeat(
         };
 
         let pub_key_bytes = signing_key.verifying_key().to_bytes();
+        let mut was_alone = true;
+        let mut last_publish = Instant::now();
 
-        // Initial publish immediately.
+        // Initial: read to discover existing peers, then merge-publish ourselves.
+        dht_read_and_join(&dht, &my_id, &pub_key_bytes, &salt, &gossip_sender, &state).await;
         dht_publish(&dht, &my_id, &signing_key, &salt, &pub_key_bytes, &neighbors, &state).await;
 
         loop {
-            // Fast while alone, slow once we have neighbors.
             let alone = neighbor_count.load(Ordering::Relaxed) == 0;
-            let base_secs = if alone {
-                DHT_FAST_INTERVAL_SECS
+
+            // Transition: alone → connected. Publish immediately.
+            if was_alone && !alone {
+                info!("first neighbor joined — publishing to DHT");
+                dht_publish(&dht, &my_id, &signing_key, &salt, &pub_key_bytes, &neighbors, &state).await;
+                last_publish = Instant::now();
+            }
+            was_alone = alone;
+
+            // Sleep: fast reads while alone, relaxed when connected.
+            let sleep_dur = if alone {
+                Duration::from_secs(DHT_ALONE_READ_SECS)
             } else {
-                DHT_HEARTBEAT_SECS
+                let jitter = rand::random::<u64>() % DHT_HEARTBEAT_JITTER_SECS.max(1);
+                Duration::from_secs(DHT_HEARTBEAT_SECS + jitter)
             };
-            let max_jitter = if alone { 2 } else { DHT_HEARTBEAT_JITTER_SECS };
-            let jitter = rand::random::<u64>() % max_jitter.max(1);
-            let sleep_dur = Duration::from_secs(base_secs + jitter);
 
             tokio::select! {
                 () = tokio::time::sleep(sleep_dur) => {}
                 () = cancel.cancelled() => break,
             }
 
-            // GET: discover new peers and feed to gossip.
-            if let Some(record) = dht.get_mutable_most_recent(&pub_key_bytes, Some(&salt)).await {
-                let peers = decode_peer_list(record.value());
-                let new_peers: Vec<_> = peers
-                    .into_iter()
-                    .filter(|id| *id != my_id)
-                    .collect();
-                if !new_peers.is_empty() {
-                    info!("DHT discovered {} peer(s), feeding to gossip", new_peers.len());
-                    if let Err(e) = gossip_sender.join_peers(new_peers).await {
-                        debug!("join_peers error: {e:#}");
-                    }
-                }
-            }
+            // Always read — cheap, discovers peers to join.
+            dht_read_and_join(&dht, &my_id, &pub_key_bytes, &salt, &gossip_sender, &state).await;
 
-            // PUT: merge-publish our info + neighbors + existing DHT peers.
-            dht_publish(&dht, &my_id, &signing_key, &salt, &pub_key_bytes, &neighbors, &state).await;
+            // Publish cadence depends on state.
+            let publish_interval = if alone {
+                Duration::from_secs(DHT_ALONE_PUBLISH_SECS)
+            } else {
+                Duration::from_secs(DHT_HEARTBEAT_SECS)
+            };
+            if last_publish.elapsed() >= publish_interval {
+                dht_publish(&dht, &my_id, &signing_key, &salt, &pub_key_bytes, &neighbors, &state).await;
+                last_publish = Instant::now();
+            }
         }
         debug!("DHT heartbeat stopped");
     });
+}
+
+/// Read the DHT and feed any discovered peers into the gossip swarm.
+async fn dht_read_and_join(
+    dht: &AsyncDht,
+    my_id: &PublicKey,
+    pub_key_bytes: &[u8; 32],
+    salt: &[u8; 20],
+    gossip_sender: &iroh_gossip::api::GossipSender,
+    state: &Arc<Mutex<SwarmState>>,
+) {
+    if let Some(record) = dht.get_mutable_most_recent(pub_key_bytes, Some(salt)).await {
+        let peers = decode_peer_list(record.value());
+        let new_peers: Vec<_> = peers
+            .into_iter()
+            .filter(|id| *id != *my_id)
+            .collect();
+        if !new_peers.is_empty() {
+            info!("DHT discovered {} peer(s), feeding to gossip", new_peers.len());
+            if let Err(e) = gossip_sender.join_peers(new_peers).await {
+                debug!("join_peers error: {e:#}");
+            }
+        }
+        if let Ok(mut s) = state.lock() {
+            s.dht_status = DhtStatus::Ready;
+        }
+    }
 }
 
 async fn dht_publish(
@@ -440,30 +483,34 @@ async fn dht_publish(
     neighbors: &Arc<Mutex<HashSet<PublicKey>>>,
     state: &Arc<Mutex<SwarmState>>,
 ) {
-    // Merge: ourselves + live neighbors + existing DHT peers (preserve others' data).
+    let has_neighbors = neighbors.lock().map(|n| !n.is_empty()).unwrap_or(false);
+
     let mut seen = HashSet::new();
     let mut peer_list: Vec<[u8; 32]> = Vec::with_capacity(MAX_DHT_PEERS);
 
-    // 1. Always include ourselves first.
+    // Always include ourselves.
     peer_list.push(*my_id.as_bytes());
     seen.insert(*my_id.as_bytes());
 
-    // 2. Add our live neighbors.
-    if let Ok(n) = neighbors.lock() {
-        for id in n.iter() {
-            if seen.insert(*id.as_bytes()) && peer_list.len() < MAX_DHT_PEERS {
-                peer_list.push(*id.as_bytes());
+    if has_neighbors {
+        // Connected: publish authoritative data — self + live neighbors only.
+        // This purges dead/stale peers from the DHT. We know who's alive
+        // because they're our active gossip neighbors.
+        if let Ok(n) = neighbors.lock() {
+            for id in n.iter() {
+                if seen.insert(*id.as_bytes()) && peer_list.len() < MAX_DHT_PEERS {
+                    peer_list.push(*id.as_bytes());
+                }
             }
         }
-    }
-
-    // 3. Preserve existing DHT peers we don't already know about.
-    if peer_list.len() < MAX_DHT_PEERS
-        && let Some(record) = dht.get_mutable_most_recent(pub_key_bytes, Some(salt)).await
-    {
-        for existing in decode_peer_list(record.value()) {
-            if seen.insert(*existing.as_bytes()) && peer_list.len() < MAX_DHT_PEERS {
-                peer_list.push(*existing.as_bytes());
+    } else {
+        // Alone: merge-publish — read existing DHT data first, add ourselves,
+        // preserve other peers. We don't know who's alive so we can't purge.
+        if let Some(record) = dht.get_mutable_most_recent(pub_key_bytes, Some(salt)).await {
+            for existing in decode_peer_list(record.value()) {
+                if seen.insert(*existing.as_bytes()) && peer_list.len() < MAX_DHT_PEERS {
+                    peer_list.push(*existing.as_bytes());
+                }
             }
         }
     }
