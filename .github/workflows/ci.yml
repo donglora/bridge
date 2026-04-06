@@ -13,13 +13,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Clone donglora (sibling dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: swaits/donglora
-          path: ../donglora
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
 
       - uses: dtolnay/rust-toolchain@master
         with:

@@ -99,8 +99,7 @@ fn connect_and_run(
     } else if let Ok(c) = donglora_client::connect_mux_auto(timeout) {
         (c, "mux".to_string())
     } else {
-        let port_path = donglora_client::find_port()
-            .ok_or_else(|| anyhow::anyhow!("no mux or USB dongle found"))?;
+        let port_path = donglora_client::find_port().ok_or_else(|| anyhow::anyhow!("no mux or USB dongle found"))?;
         info!("no mux found, connecting to serial port {port_path}");
         let c = donglora_client::connect(Some(&port_path), timeout)?;
         (c, shorten_path(&port_path))

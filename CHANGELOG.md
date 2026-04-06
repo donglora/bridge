@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1] - 2026-04-06
+
+### Fixed
+
+- CI: removed stale sibling-clone step, added `libudev-dev` dependency,
+  upgraded `actions/checkout` to v5 (Node.js 24).
+
 ## [0.2.0] - 2026-04-06
 
 ### Added
