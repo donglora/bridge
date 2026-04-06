@@ -1,11 +1,4 @@
-mod config;
-mod gossip;
-mod packet;
-mod radio;
-mod rate_limit;
-mod router;
-mod setup;
-mod tui;
+use donglora_bridge::{config, gossip, radio, rate_limit, router, setup, tui};
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,6 +36,7 @@ enum Commands {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -53,12 +47,8 @@ async fn main() -> Result<()> {
     };
 
     // Config subcommand: run wizard with existing config as defaults.
-    if let Some(Commands::Config) = cli.command {
-        let existing = if config_path.exists() {
-            config::load_config(&config_path).ok()
-        } else {
-            None
-        };
+    if matches!(cli.command, Some(Commands::Config)) {
+        let existing = if config_path.exists() { config::load_config(&config_path).ok() } else { None };
         return setup::run_wizard(&config_path, existing.as_ref());
     }
 
@@ -69,39 +59,11 @@ async fn main() -> Result<()> {
     }
 
     // Load config.
-    let cfg = config::load_config(&config_path)
-        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let cfg =
+        config::load_config(&config_path).with_context(|| format!("loading config from {}", config_path.display()))?;
 
     // Set up logging.
-    if cli.log_only {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .init();
-    } else {
-        let log_path = cfg
-            .bridge
-            .log_file
-            .clone()
-            .unwrap_or_else(|| config::default_log_path().unwrap_or_else(|_| "/tmp/donglora-bridge.log".into()));
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let file_appender = tracing_appender::rolling::never(
-            log_path.parent().unwrap_or(std::path::Path::new("/tmp")),
-            log_path.file_name().unwrap_or(std::ffi::OsStr::new("donglora-bridge.log")),
-        );
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_writer(file_appender)
-            .with_ansi(false)
-            .init();
-    }
+    setup_logging(cli.log_only, &cfg);
 
     // Ephemeral identity — fresh keypair each launch.
     let secret_key = SecretKey::generate(&mut rand::rng());
@@ -126,25 +88,22 @@ async fn main() -> Result<()> {
     info!("rate limiter: {:.1} pps", rate_limiter.rate_pps());
 
     // Create gossip network.
-    let (swarm, gossip_event_rx, gossip_frame_tx) =
-        gossip::Gossip::new(secret_key, &keys).await?;
+    let (swarm, gossip_event_rx, gossip_frame_tx) = gossip::Gossip::new(secret_key, &keys).await?;
     let swarm = Arc::new(swarm);
 
     // Start radio.
-    let (radio_event_rx, radio_tx) = radio::spawn(radio_config, cfg.radio.port.clone());
+    let (radio_event_rx, radio_tx) = radio::spawn(radio_config, cfg.radio.port.clone())?;
 
     // Stats + log channel + radio config watch.
     let stats = Arc::new(Stats::default());
     let (log_tx, log_rx) = mpsc::channel(512);
-    let (config_watch_tx, config_watch_rx) = tokio::sync::watch::channel(
-        router::RadioConfigInfo {
-            active: radio_config,
-            requested: radio_config,
-            source: radio::ConfigSource::Ours,
-            device: String::new(),
-            connected: false,
-        },
-    );
+    let (config_watch_tx, config_watch_rx) = tokio::sync::watch::channel(router::RadioConfigInfo {
+        active: radio_config,
+        requested: radio_config,
+        source: radio::ConfigSource::Ours,
+        device: String::new(),
+        connected: false,
+    });
 
     // Cancellation.
     let cancel = CancellationToken::new();
@@ -180,9 +139,7 @@ async fn main() -> Result<()> {
     {
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            let sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            );
+            let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
             match sigterm {
                 Ok(mut sigterm) => {
                     tokio::select! {
@@ -205,15 +162,7 @@ async fn main() -> Result<()> {
         info!("running in headless mode");
         cancel.cancelled().await;
     } else {
-        let terminal = tui::run(
-            config_watch_rx,
-            swarm.clone(),
-            stats,
-            log_rx,
-            cancel.clone(),
-            start_time,
-        )
-        .await;
+        let terminal = tui::run(config_watch_rx, swarm.clone(), stats, log_rx, cancel.clone(), start_time);
 
         cancel.cancel();
         swarm.shutdown().await;
@@ -231,4 +180,31 @@ async fn main() -> Result<()> {
     info!("donglora-bridge stopped");
 
     Ok(())
+}
+
+fn setup_logging(log_only: bool, cfg: &config::Config) {
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+
+    if log_only {
+        tracing_subscriber::fmt().with_env_filter(env_filter()).init();
+    } else {
+        let log_path = cfg
+            .bridge
+            .log_file
+            .clone()
+            .unwrap_or_else(|| config::default_log_path().unwrap_or_else(|_| "/tmp/donglora-bridge.log".into()));
+        if let Some(parent) = log_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("warning: failed to create log directory {}: {e}", parent.display());
+        }
+        let file_appender = tracing_appender::rolling::never(
+            log_path.parent().unwrap_or_else(|| std::path::Path::new("/tmp")),
+            log_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("donglora-bridge.log")),
+        );
+        tracing_subscriber::fmt().with_env_filter(env_filter()).with_writer(file_appender).with_ansi(false).init();
+    }
 }
