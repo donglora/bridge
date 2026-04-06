@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use iroh::SecretKey;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::gossip::PassphraseKeys;
 use crate::rate_limit::RateLimiter;
@@ -180,12 +180,21 @@ async fn main() -> Result<()> {
     {
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            let mut sigterm = tokio::signal::unix::signal(
+            let sigterm = tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::terminate(),
-            ).expect("failed to register SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
-                _ = sigterm.recv() => info!("received SIGTERM"),
+            );
+            match sigterm {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
+                        _ = sigterm.recv() => info!("received SIGTERM"),
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to register SIGTERM handler: {e:#}");
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("received SIGINT");
+                }
             }
             cancel.cancel();
         });
