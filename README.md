@@ -39,16 +39,17 @@ similar ESP32+SX1262 board) into a USB LoRa dongle. You will need to:
 
 ### 2. (Optional) donglora-mux
 
-If you want multiple programs to share a single DongLoRa radio at the same time,
-install the multiplexer daemon:
+The bridge works fine without the mux -- it connects directly to the USB device.
+The mux is only needed if you want multiple programs to share a single DongLoRa
+radio at the same time (e.g. running two bridges with different configs, or a
+bridge alongside another donglora-client program).
 
 ```sh
 cargo install donglora-mux
 ```
 
-Run `donglora-mux` before starting the bridge. The bridge will auto-detect and
-connect to the mux. Without the mux, the bridge talks to the USB device
-directly, which means only one program can use the radio at a time.
+Run `donglora-mux` before starting the bridge. The bridge auto-detects the mux
+when it's running and falls back to direct USB serial when it's not.
 
 ### 3. donglora-bridge (this project)
 
@@ -112,6 +113,22 @@ donglora-bridge --config path.toml # custom config file
 donglora-bridge config             # re-run setup wizard
 ```
 
+### Running multiple bridges
+
+To run more than one bridge on the same machine (e.g. bridging two separate
+MeshCore networks), create a config file per bridge and run each with
+`--config`:
+
+```sh
+donglora-bridge --config ~/bridge-network-a.toml
+donglora-bridge --config ~/bridge-network-b.toml
+```
+
+Each config can specify a different passphrase, different radio settings, and
+(if using the mux) share the same radio. Without the mux, each bridge needs its
+own USB dongle and an explicit `port` in its config to avoid both trying to open
+the same device.
+
 ## Features
 
 - **Gossip swarm** -- broadcast packets via [iroh-gossip](https://github.com/n0-computer/iroh), a QUIC-based overlay network
@@ -142,7 +159,7 @@ Default location: `~/.config/donglora-bridge/config.toml`
 
 ```toml
 [radio]
-# port = "/dev/ttyACM0"   # serial port (omit for auto-detect via mux)
+# port = "/dev/ttyACM0"   # serial port (omit for auto-detect: tries mux, then USB)
 frequency = 910525000      # Hz (default: 910.525 MHz)
 bandwidth = "62.5kHz"      # 7.8kHz, 10.4kHz, 15.6kHz, 20.8kHz, 31.25kHz,
                            # 41.7kHz, 62.5kHz, 125kHz, 250kHz, 500kHz

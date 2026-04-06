@@ -96,9 +96,14 @@ fn connect_and_run(
     let (mut client, device) = if let Some(port) = port {
         let c = donglora_client::connect(Some(port), timeout)?;
         (c, shorten_path(port))
-    } else {
-        let c = donglora_client::connect_mux_auto(timeout)?;
+    } else if let Ok(c) = donglora_client::connect_mux_auto(timeout) {
         (c, "mux".to_string())
+    } else {
+        let port_path = donglora_client::find_port()
+            .ok_or_else(|| anyhow::anyhow!("no mux or USB dongle found"))?;
+        info!("no mux found, connecting to serial port {port_path}");
+        let c = donglora_client::connect(Some(&port_path), timeout)?;
+        (c, shorten_path(&port_path))
     };
     info!("[radio] transport connected: {device}");
 
@@ -112,7 +117,7 @@ fn connect_and_run(
     }
 
     info!("[radio] negotiating config...");
-    let (active_config, config_source) = match negotiate_config(&mut client, config) {
+    let (active_config, config_source) = match negotiate_config(&mut client, config, &device) {
         Ok(result) => {
             info!("[radio] config negotiated: source={:?}, config={}", result.1, format_radio_config(&result.0));
             result
@@ -203,28 +208,31 @@ fn connect_and_run(
 /// Negotiate radio config with the dongle/mux.
 ///
 /// Strategy:
-/// 1. `GetConfig` first to read what's active (caches the result).
+/// 1. `GetConfig` first to read what's active.
 /// 2. If it matches our desired config, use it — no `SetConfig` needed.
-/// 3. If it differs, only try `SetConfig` if we haven't been rejected before.
-/// 4. If `SetConfig` is rejected, set the flag IMMEDIATELY (before the mux can
-///    disconnect us and lose this state), then return the cached `GetConfig` result.
-///
-/// On reconnect, the flag ensures we never retry `SetConfig`.
+/// 3. If it differs and we're on the mux, accept the mux's config.
+/// 4. If it differs and we're on direct serial, `SetConfig` to push ours.
+/// 5. If `GetConfig` fails, try `SetConfig` with our desired config.
 fn negotiate_config<T: Transport>(
     client: &mut donglora_client::Client<T>,
     desired: &RadioConfig,
+    device: &str,
 ) -> Result<(RadioConfig, ConfigSource)> {
     info!("[negotiate] get_config...");
     match client.get_config() {
         Ok(cfg) => {
-            let source = if configs_match(&cfg, desired) {
+            if configs_match(&cfg, desired) {
                 info!("[negotiate] get_config OK (matches desired): {}", format_radio_config(&cfg));
-                ConfigSource::Ours
+                Ok((cfg, ConfigSource::Ours))
+            } else if device == "mux" {
+                info!("[negotiate] get_config OK (mux config differs, accepting): {}", format_radio_config(&cfg));
+                Ok((cfg, ConfigSource::Mux))
             } else {
-                info!("[negotiate] get_config OK (differs from desired): {}", format_radio_config(&cfg));
-                ConfigSource::Mux
-            };
-            Ok((cfg, source))
+                info!("[negotiate] get_config OK (serial config differs, setting ours)");
+                client.set_config(*desired)?;
+                info!("[negotiate] set_config OK");
+                Ok((*desired, ConfigSource::Ours))
+            }
         }
         Err(e) => {
             info!("[negotiate] get_config FAILED: {e:#}");

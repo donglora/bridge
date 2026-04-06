@@ -1,0 +1,21 @@
+# Changelog
+
+## [0.2.0] - 2026-04-06
+
+### Added
+
+- Auto-detect connection mode: when no `port` is configured, the bridge now
+  tries the mux daemon first and falls back to direct USB serial
+  (`find_port()`) if the mux is unavailable. Previously it would retry the mux
+  forever.
+
+### Changed
+
+- Config negotiation on direct serial connections now pushes `SetConfig` with
+  the desired radio config when it differs from the dongle's current config.
+  On mux connections, the existing behavior (accept the mux's config) is
+  unchanged.
+
+## [0.1.0] - 2026-04-06
+
+Initial release.
