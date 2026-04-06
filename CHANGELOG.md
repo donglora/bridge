@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2] - 2026-04-06
+
+### Fixed
+
+- TUI now fits in 80-column terminals (was 86).
+
 ## [0.2.1] - 2026-04-06
 
 ### Fixed

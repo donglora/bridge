@@ -245,8 +245,8 @@ fn draw_ui(
     series: &TimeSeries,
 ) {
     // Minimum terminal size for the 3-column layout.
-    if area.width < 86 || area.height < 12 {
-        let msg = format!("Terminal too small ({}x{}), need 86x12+", area.width, area.height);
+    if area.width < 80 || area.height < 12 {
+        let msg = format!("Terminal too small ({}x{}), need 80x12+", area.width, area.height);
         frame.render_widget(
             Paragraph::new(msg).alignment(Alignment::Center).style(Style::default().fg(C_RATE_DROP)),
             area,
@@ -266,7 +266,7 @@ fn draw_ui(
     // Packet log columns: Age=5 Hash=8 RF=4 Net=4 Size=6 RSSI=6 SNR=5 Act=5 = 43 + 2 border + 1 pad = 46
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Length(46), Constraint::Min(10)])
+        .constraints([Constraint::Length(30), Constraint::Length(46), Constraint::Min(4)])
         .split(rows[1]);
 
     // Left column: Network, Radio, Stats stacked.
