@@ -1,3 +1,9 @@
+//! iroh-gossip swarm management and mainline DHT peer discovery.
+//!
+//! Derives cryptographic keys from a shared passphrase, manages the gossip
+//! subscription, and maintains a DHT heartbeat for zero-configuration peer
+//! bootstrapping.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -5,12 +11,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use futures_lite::StreamExt;
 use iroh::endpoint::Incoming;
 use iroh::{Endpoint, PublicKey, SecretKey};
-use futures_lite::StreamExt;
-use iroh_gossip::api::Event;
-use iroh_gossip::net::{Gossip as GossipActor, GOSSIP_ALPN};
 use iroh_gossip::TopicId;
+use iroh_gossip::api::Event;
+use iroh_gossip::net::{GOSSIP_ALPN, Gossip as GossipActor};
 use mainline::async_dht::AsyncDht;
 use mainline::{Dht, MutableItem, SigningKey};
 use sha2::{Digest, Sha256};
@@ -25,12 +31,14 @@ use crate::packet::GossipFrame;
 /// Conservative cap to stay under BEP44's 1000-byte value limit.
 const MAX_DHT_PEERS: usize = 27;
 
-/// DHT heartbeat interval (base, before jitter).
+/// DHT heartbeat interval when connected (base, before jitter). 5 minutes
+/// balances freshness against DHT write amplification — connected nodes already
+/// have live gossip links and only need DHT for newcomer discovery.
 const DHT_HEARTBEAT_SECS: u64 = 300;
 
-/// Maximum random jitter added to heartbeat interval.
+/// Maximum random jitter added to heartbeat interval. Prevents synchronized
+/// publish storms when multiple bridges start simultaneously.
 const DHT_HEARTBEAT_JITTER_SECS: u64 = 60;
-
 
 // ── Key derivation ───────────────────────────────────────────────
 
@@ -43,29 +51,44 @@ pub struct PassphraseKeys {
 
 impl PassphraseKeys {
     /// Derive all keys from a passphrase.
+    ///
+    /// Intermediate buffers containing the passphrase are zeroized after use to
+    /// minimize time sensitive material spends in memory.
+    #[must_use]
     pub fn derive(passphrase: &str) -> Self {
         // Application-specific prefix to avoid DHT collisions with other apps.
-        const APP_PREFIX: &str = "donglora-bridge:";
+        const APP_PREFIX: &[u8] = b"donglora-bridge:";
+
+        // Helper: build a zeroized buffer of [prefix | suffix | passphrase].
+        let keyed_buf = |suffix: &[u8]| -> Vec<u8> {
+            let mut buf = Vec::with_capacity(APP_PREFIX.len() + suffix.len() + passphrase.len());
+            buf.extend_from_slice(APP_PREFIX);
+            buf.extend_from_slice(suffix);
+            buf.extend_from_slice(passphrase.as_bytes());
+            buf
+        };
 
         // Topic ID: blake3 hash of prefixed passphrase.
-        let topic_bytes = *blake3::hash(format!("{APP_PREFIX}{passphrase}").as_bytes()).as_bytes();
+        let mut buf = keyed_buf(b"");
+        let topic_bytes = *blake3::hash(&buf).as_bytes();
         let topic_id = TopicId::from_bytes(topic_bytes);
+        zeroize::Zeroize::zeroize(&mut buf);
 
-        // DHT signing key: ed25519 from SHA-256 of prefixed passphrase + "sign".
-        let sign_seed = Sha256::digest(format!("{APP_PREFIX}sign:{passphrase}").as_bytes());
+        // DHT signing key: ed25519 from SHA-256 of prefixed passphrase + "sign:".
+        let mut buf = keyed_buf(b"sign:");
+        let sign_seed = Sha256::digest(&buf);
         let seed_bytes: [u8; 32] = sign_seed.into();
         let dht_signing_key = SigningKey::from_bytes(&seed_bytes);
+        zeroize::Zeroize::zeroize(&mut buf);
 
-        // DHT salt: first 20 bytes of SHA-256 of prefixed passphrase + "salt".
-        let salt_hash = Sha256::digest(format!("{APP_PREFIX}salt:{passphrase}").as_bytes());
+        // DHT salt: first 20 bytes of SHA-256 of prefixed passphrase + "salt:".
+        let mut buf = keyed_buf(b"salt:");
+        let salt_hash = Sha256::digest(&buf);
         let mut dht_salt = [0u8; 20];
         dht_salt.copy_from_slice(&salt_hash[..20]);
+        zeroize::Zeroize::zeroize(&mut buf);
 
-        Self {
-            topic_id,
-            dht_signing_key,
-            dht_salt,
-        }
+        Self { topic_id, dht_signing_key, dht_salt }
     }
 }
 
@@ -80,6 +103,7 @@ pub struct SwarmState {
     pub last_dht_publish: Option<Instant>,
 }
 
+/// Status of the mainline DHT connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DhtStatus {
     Bootstrapping,
@@ -112,7 +136,9 @@ pub enum GossipEvent {
 /// Handle to the gossip swarm. Manages iroh endpoint, gossip subscription, and DHT.
 pub struct Gossip {
     endpoint: Endpoint,
-    gossip: GossipActor,
+    actor: GossipActor,
+    // std::sync::Mutex (not tokio::sync::Mutex) because locks are never held across
+    // .await points. This avoids async-aware mutex overhead for brief critical sections.
     state: Arc<Mutex<SwarmState>>,
     neighbors: Arc<Mutex<HashSet<PublicKey>>>,
     dht_signing_key: SigningKey,
@@ -147,7 +173,7 @@ impl Gossip {
         info!("iroh endpoint bound, id: {}", my_id.fmt_short());
 
         // Build gossip actor.
-        let gossip = GossipActor::builder().spawn(endpoint.clone());
+        let actor = GossipActor::builder().spawn(endpoint.clone());
 
         // Bootstrap from DHT.
         let bootstrap_peers = dht_get_peers(keys).await;
@@ -158,10 +184,7 @@ impl Gossip {
         }
 
         // Subscribe to gossip topic.
-        let topic = gossip
-            .subscribe(keys.topic_id, bootstrap_peers)
-            .await
-            .context("subscribing to gossip topic")?;
+        let topic = actor.subscribe(keys.topic_id, bootstrap_peers).await.context("subscribing to gossip topic")?;
 
         let (sender, receiver) = topic.split();
 
@@ -182,7 +205,7 @@ impl Gossip {
 
         let handle = Self {
             endpoint: endpoint.clone(),
-            gossip: gossip.clone(),
+            actor: actor.clone(),
             state: state.clone(),
             neighbors: neighbors.clone(),
             dht_signing_key: keys.dht_signing_key.clone(),
@@ -191,7 +214,7 @@ impl Gossip {
         };
 
         // Spawn accept loop.
-        spawn_accept_loop(endpoint.clone(), gossip.clone(), cancel.clone());
+        spawn_accept_loop(endpoint.clone(), actor.clone(), cancel.clone());
 
         // Spawn gossip receiver task.
         spawn_receiver(receiver, event_tx, state.clone(), neighbor_count.clone(), neighbors.clone(), cancel.clone());
@@ -221,8 +244,9 @@ impl Gossip {
     }
 
     /// Snapshot of swarm state for TUI.
+    #[must_use]
     pub fn swarm_state(&self) -> SwarmState {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// Graceful shutdown. Publishes neighbors (without ourselves) to DHT
@@ -232,7 +256,7 @@ impl Gossip {
         let neighbor_ids: Vec<[u8; 32]> = self
             .neighbors
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|id| *id.as_bytes())
             .collect();
@@ -242,14 +266,9 @@ impl Gossip {
             let value = encode_peer_list(&neighbor_ids);
             let seq = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
+                .map(|d| d.as_secs().cast_signed())
                 .unwrap_or(0);
-            let item = MutableItem::new(
-                self.dht_signing_key.clone(),
-                &value,
-                seq,
-                Some(self.dht_salt.as_ref()),
-            );
+            let item = MutableItem::new(self.dht_signing_key.clone(), &value, seq, Some(self.dht_salt.as_ref()));
             match dht.put_mutable(item, None).await {
                 Ok(_) => info!("shutdown: published {} neighbor(s) to DHT (removed self)", neighbor_ids.len()),
                 Err(e) => debug!("shutdown: DHT publish failed: {e:#}"),
@@ -257,7 +276,7 @@ impl Gossip {
         }
 
         self.cancel.cancel();
-        let _ = self.gossip.shutdown().await;
+        let _ = self.actor.shutdown().await;
         self.endpoint.close().await;
     }
 }
@@ -316,18 +335,29 @@ fn spawn_receiver(
                         debug!("received malformed gossip frame ({} bytes)", msg.content.len());
                     }
                 }
+                // Neighbor count is tracked in both AtomicUsize (for lock-free reads in DHT
+                // heartbeat) and SwarmState (for TUI snapshots). Brief inconsistency between
+                // the two is acceptable — the TUI polls at 250ms intervals.
                 Event::NeighborUp(id) => {
                     let count = neighbor_count.fetch_add(1, Ordering::Relaxed) + 1;
                     info!("neighbor up: {} (total: {count})", id.fmt_short());
-                    if let Ok(mut n) = neighbors.lock() { n.insert(id); }
-                    if let Ok(mut s) = state.lock() { s.neighbor_count = count; }
+                    if let Ok(mut n) = neighbors.lock() {
+                        n.insert(id);
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.neighbor_count = count;
+                    }
                     let _ = event_tx.send(GossipEvent::NeighborChanged(count)).await;
                 }
                 Event::NeighborDown(id) => {
                     let count = neighbor_count.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
                     info!("neighbor down: {} (total: {count})", id.fmt_short());
-                    if let Ok(mut n) = neighbors.lock() { n.remove(&id); }
-                    if let Ok(mut s) = state.lock() { s.neighbor_count = count; }
+                    if let Ok(mut n) = neighbors.lock() {
+                        n.remove(&id);
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.neighbor_count = count;
+                    }
                     let _ = event_tx.send(GossipEvent::NeighborChanged(count)).await;
                 }
                 Event::Lagged => {
@@ -361,11 +391,13 @@ fn spawn_broadcaster(
     });
 }
 
-/// DHT poll interval while alone (read frequently, publish infrequently).
+/// DHT poll interval while alone. 3 seconds is aggressive but reads are cheap
+/// (single DHT GET) and fast discovery matters when two nodes start together.
 const DHT_ALONE_READ_SECS: u64 = 3;
 
-/// How often a lonely node publishes (merge-only, never destructive).
-/// Slower than reads — publishing is heavier and a lonely node only adds itself.
+/// How often a lonely node publishes (merge-only, never destructive). 30 seconds
+/// is much slower than reads because DHT PUT is heavier and a lonely node only
+/// adds itself to the peer list.
 const DHT_ALONE_PUBLISH_SECS: u64 = 30;
 
 /// Periodically interact with the DHT to discover and share peers.
@@ -458,10 +490,7 @@ async fn dht_read_and_join(
 ) {
     if let Some(record) = dht.get_mutable_most_recent(pub_key_bytes, Some(salt)).await {
         let peers = decode_peer_list(record.value());
-        let new_peers: Vec<_> = peers
-            .into_iter()
-            .filter(|id| *id != *my_id)
-            .collect();
+        let new_peers: Vec<_> = peers.into_iter().filter(|id| *id != *my_id).collect();
         if !new_peers.is_empty() {
             info!("DHT discovered {} peer(s), feeding to gossip", new_peers.len());
             if let Err(e) = gossip_sender.join_peers(new_peers).await {
@@ -483,7 +512,7 @@ async fn dht_publish(
     neighbors: &Arc<Mutex<HashSet<PublicKey>>>,
     state: &Arc<Mutex<SwarmState>>,
 ) {
-    let has_neighbors = neighbors.lock().map(|n| !n.is_empty()).unwrap_or(false);
+    let has_neighbors = neighbors.lock().is_ok_and(|n| !n.is_empty());
 
     let mut seen = HashSet::new();
     let mut peer_list: Vec<[u8; 32]> = Vec::with_capacity(MAX_DHT_PEERS);
@@ -518,7 +547,7 @@ async fn dht_publish(
     let value = encode_peer_list(&peer_list);
     let seq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_secs().cast_signed())
         .unwrap_or(0);
 
     let item = MutableItem::new(signing_key.clone(), &value, seq, Some(salt.as_ref()));
@@ -552,22 +581,24 @@ async fn dht_get_peers(keys: &PassphraseKeys) -> Vec<PublicKey> {
     };
 
     let pub_key_bytes = keys.dht_signing_key.verifying_key().to_bytes();
-    match dht.get_mutable_most_recent(&pub_key_bytes, Some(&keys.dht_salt)).await {
-        Some(record) => {
+    dht.get_mutable_most_recent(&pub_key_bytes, Some(&keys.dht_salt)).await.map_or_else(
+        || {
+            debug!("DHT bootstrap: no existing record");
+            vec![]
+        },
+        |record| {
             let peers = decode_peer_list(record.value());
             debug!("DHT bootstrap: found {} peer(s)", peers.len());
             peers
-        }
-        None => {
-            debug!("DHT bootstrap: no existing record");
-            vec![]
-        }
-    }
+        },
+    )
 }
 
 /// Encode a list of 32-byte peer IDs into bytes for DHT storage.
-/// Format: [count: u16 LE] [id_0: 32B] [id_1: 32B] ...
-fn encode_peer_list(peers: &[[u8; 32]]) -> Vec<u8> {
+/// Format: `[count: u16 LE] [id_0: 32B] [id_1: 32B] ...`
+#[must_use]
+pub fn encode_peer_list(peers: &[[u8; 32]]) -> Vec<u8> {
+    #[allow(clippy::cast_possible_truncation)] // MAX_DHT_PEERS (27) fits in u16
     let count = peers.len().min(MAX_DHT_PEERS) as u16;
     let mut buf = Vec::with_capacity(2 + (count as usize) * 32);
     buf.extend_from_slice(&count.to_le_bytes());
@@ -578,7 +609,8 @@ fn encode_peer_list(peers: &[[u8; 32]]) -> Vec<u8> {
 }
 
 /// Decode a peer list from DHT record value.
-fn decode_peer_list(data: &[u8]) -> Vec<PublicKey> {
+#[must_use]
+pub fn decode_peer_list(data: &[u8]) -> Vec<PublicKey> {
     if data.len() < 2 {
         return vec![];
     }
@@ -655,5 +687,83 @@ mod tests {
         data.extend_from_slice(&[0xAA; 32]); // only 1 peer
         let decoded = decode_peer_list(&data);
         assert_eq!(decoded.len(), 1);
+    }
+
+    #[test]
+    fn dht_status_display() {
+        assert_eq!(format!("{}", DhtStatus::Bootstrapping), "Bootstrapping");
+        assert_eq!(format!("{}", DhtStatus::Ready), "Ready");
+        assert_eq!(format!("{}", DhtStatus::PublishFailed), "Failed");
+    }
+
+    #[test]
+    fn decode_peer_list_exact_boundary() {
+        // Build data with count=2 and exactly 2 + 32 + 32 = 66 bytes.
+        // Both peers should decode successfully.
+        let sk0 = iroh::SecretKey::generate(&mut rand::rng());
+        let sk1 = iroh::SecretKey::generate(&mut rand::rng());
+        let id0 = *sk0.public().as_bytes();
+        let id1 = *sk1.public().as_bytes();
+
+        let mut data = vec![2, 0]; // count = 2 (u16 LE)
+        data.extend_from_slice(&id0);
+        data.extend_from_slice(&id1);
+        assert_eq!(data.len(), 66);
+
+        let decoded = decode_peer_list(&data);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(*decoded[0].as_bytes(), id0);
+        assert_eq!(*decoded[1].as_bytes(), id1);
+    }
+
+    #[test]
+    fn decode_peer_list_one_byte_short() {
+        // Build data with count=2 but only 2 + 32 + 31 = 65 bytes.
+        // First peer decodes, second is truncated and skipped.
+        let sk0 = iroh::SecretKey::generate(&mut rand::rng());
+        let sk1 = iroh::SecretKey::generate(&mut rand::rng());
+        let id0 = *sk0.public().as_bytes();
+        let id1 = *sk1.public().as_bytes();
+
+        let mut data = vec![2, 0]; // count = 2 (u16 LE)
+        data.extend_from_slice(&id0);
+        data.extend_from_slice(&id1[..31]); // only 31 bytes of second peer
+        assert_eq!(data.len(), 65);
+
+        let decoded = decode_peer_list(&data);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(*decoded[0].as_bytes(), id0);
+    }
+
+    #[test]
+    fn decode_peer_list_count_header_only() {
+        // Data with exactly 2 bytes (count=0). Must not be rejected by the length check.
+        // Kills mutant: `data.len() < 2` → `data.len() <= 2`.
+        let data = [0u8, 0]; // count = 0
+        let decoded = decode_peer_list(&data);
+        assert!(decoded.is_empty());
+
+        // Data with 2 bytes but count=1 and no peer data — decodes 0 (truncated).
+        let data = [1u8, 0]; // count = 1 but no peer bytes
+        let decoded = decode_peer_list(&data);
+        assert!(decoded.is_empty());
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn peer_list_roundtrip_prop(count in 0usize..=30) {
+                let keys: Vec<[u8; 32]> = (0..count)
+                    .map(|_| *iroh::SecretKey::generate(&mut rand::rng()).public().as_bytes())
+                    .collect();
+                let encoded = encode_peer_list(&keys);
+                let decoded = decode_peer_list(&encoded);
+                let expected = count.min(MAX_DHT_PEERS);
+                prop_assert_eq!(decoded.len(), expected);
+            }
+        }
     }
 }

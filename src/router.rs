@@ -1,3 +1,8 @@
+//! Central packet bus bridging radio and gossip swarm.
+//!
+//! Applies blake3 content-hash deduplication, token bucket rate limiting,
+//! and TX queue management.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -81,6 +86,7 @@ pub struct Stats {
 }
 
 impl Stats {
+    #[must_use]
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             radio_rx: self.radio_rx.load(Ordering::Relaxed),
@@ -96,6 +102,7 @@ impl Stats {
     }
 }
 
+/// Point-in-time snapshot of bridge statistics, cloned from atomic counters.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     pub radio_rx: u64,
@@ -117,10 +124,7 @@ struct DedupCache {
 
 impl DedupCache {
     fn new(ttl: Duration) -> Self {
-        Self {
-            entries: HashMap::new(),
-            ttl,
-        }
+        Self { entries: HashMap::new(), ttl }
     }
 
     /// Returns true if the key was already present (i.e., duplicate).
@@ -144,7 +148,7 @@ impl DedupCache {
 /// Run the router — the central packet bus.
 ///
 /// Bridges radio packets to/from the gossip swarm with deduplication and rate limiting.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run(
     our_id: PublicKey,
     dedup_window: Duration,
@@ -294,6 +298,7 @@ pub async fn run(
                         }).await;
                     }
                     GossipEvent::NeighborChanged(count) => {
+                        #[allow(clippy::cast_possible_truncation)]
                         stats.neighbor_count.store(count as u64, Ordering::Relaxed);
                     }
                 }
@@ -307,5 +312,113 @@ pub async fn run(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_cache_new_key_not_duplicate() {
+        let mut cache = DedupCache::new(Duration::from_secs(10));
+        assert!(!cache.check_and_insert([0u8; 32]));
+    }
+
+    #[test]
+    fn dedup_cache_duplicate_detected() {
+        let mut cache = DedupCache::new(Duration::from_secs(10));
+        cache.check_and_insert([1u8; 32]);
+        assert!(cache.check_and_insert([1u8; 32]));
+    }
+
+    #[test]
+    fn dedup_cache_different_keys_independent() {
+        let mut cache = DedupCache::new(Duration::from_secs(10));
+        cache.check_and_insert([1u8; 32]);
+        assert!(!cache.check_and_insert([2u8; 32]));
+    }
+
+    #[test]
+    fn dedup_cache_expired_entry_not_duplicate() {
+        let mut cache = DedupCache::new(Duration::from_millis(1));
+        cache.check_and_insert([1u8; 32]);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!cache.check_and_insert([1u8; 32]));
+    }
+
+    #[test]
+    fn dedup_cache_prune_removes_expired() {
+        let mut cache = DedupCache::new(Duration::from_millis(1));
+        cache.check_and_insert([1u8; 32]);
+        cache.check_and_insert([2u8; 32]);
+        std::thread::sleep(Duration::from_millis(5));
+        cache.prune();
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn dedup_cache_prune_keeps_fresh() {
+        let mut cache = DedupCache::new(Duration::from_secs(10));
+        cache.check_and_insert([1u8; 32]);
+        cache.prune();
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn stats_snapshot_reflects_increments() {
+        let stats = Stats::default();
+        stats.radio_rx.fetch_add(5, Ordering::Relaxed);
+        stats.gossip_tx.fetch_add(3, Ordering::Relaxed);
+        stats.radio_connected.store(1, Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.radio_rx, 5);
+        assert_eq!(snap.gossip_tx, 3);
+        assert!(snap.radio_connected);
+    }
+
+    #[test]
+    fn stats_default_is_zeroed() {
+        let snap = Stats::default().snapshot();
+        assert_eq!(snap.radio_rx, 0);
+        assert_eq!(snap.gossip_rx, 0);
+        assert!(!snap.radio_connected);
+    }
+
+    #[test]
+    fn packet_action_display() {
+        assert_eq!(format!("{}", PacketAction::Bridged), "");
+        assert_eq!(format!("{}", PacketAction::DroppedDedup), "DUP");
+        assert_eq!(format!("{}", PacketAction::DroppedQueueFull), "FULL");
+        assert_eq!(format!("{}", PacketAction::DroppedRateLimit), "RATE");
+    }
+
+    #[test]
+    fn dedup_cache_ttl_boundary_check_and_insert() {
+        // Force an entry's timestamp to be exactly TTL ago. With `< ttl`, the entry
+        // at exactly TTL is NOT a duplicate. With `<= ttl` (the mutant), it would
+        // wrongly be treated as still live.
+        let ttl = Duration::from_secs(10);
+        let mut cache = DedupCache::new(ttl);
+        cache.check_and_insert([9u8; 32]);
+        // Backdate the entry to exactly TTL ago.
+        let exactly_ttl_ago = Instant::now().checked_sub(ttl).unwrap();
+        cache.entries.insert([9u8; 32], exactly_ttl_ago);
+        // duration_since(exactly_ttl_ago) == ttl, so `< ttl` is false → not duplicate.
+        // The mutant `<= ttl` would say true → duplicate. This catches it.
+        assert!(!cache.check_and_insert([9u8; 32]), "entry at exact TTL must be treated as expired");
+    }
+
+    #[test]
+    fn dedup_cache_ttl_boundary_prune() {
+        let ttl = Duration::from_secs(10);
+        let mut cache = DedupCache::new(ttl);
+        cache.check_and_insert([8u8; 32]);
+        // Backdate to exactly TTL ago.
+        let exactly_ttl_ago = Instant::now().checked_sub(ttl).unwrap();
+        cache.entries.insert([8u8; 32], exactly_ttl_ago);
+        cache.prune();
+        assert!(cache.entries.is_empty(), "entry at exact TTL must be pruned");
     }
 }

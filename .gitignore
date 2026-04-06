@@ -1,1 +1,11 @@
 /target
+/fuzz/target
+/fuzz/corpus
+/fuzz/Cargo.lock
+/mutants.out
+/mutants.out.old
+.jj/
+*.swp
+*.swo
+*~
+.DS_Store
