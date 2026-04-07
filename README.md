@@ -1,6 +1,6 @@
 # donglora-bridge
 
-[![CI](https://github.com/swaits/donglora-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/swaits/donglora-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/donglora/bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/donglora/bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-1.94.1%2B-orange)
 
@@ -25,12 +25,12 @@ through an encrypted peer-to-peer gossip swarm.
 
 ### 1. A DongLoRa radio
 
-[DongLoRa](https://github.com/swaits/donglora) is open-source firmware that
+[DongLoRa](https://github.com/donglora/firmware) is open-source firmware that
 turns a supported LoRa development board (such as a Heltec WiFi LoRa 32 or
 similar ESP32+SX1262 board) into a USB LoRa dongle. You will need to:
 
 1. **Get a board** -- any ESP32 board with an SX1262 LoRa radio that DongLoRa
-   supports. See the [DongLoRa README](https://github.com/swaits/donglora) for
+   supports. See the [DongLoRa README](https://github.com/donglora/firmware) for
    the full list.
 2. **Flash the DongLoRa firmware** onto the board. Instructions are in the
    DongLoRa repository.
@@ -68,7 +68,7 @@ mise use -g cargo:donglora-bridge
 Or build from source:
 
 ```sh
-git clone https://github.com/swaits/donglora-bridge.git
+git clone https://github.com/donglora/bridge.git
 cd donglora-bridge
 cargo build --release
 ```

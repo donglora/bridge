@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0] - 2026-04-07
+
+### Changed
+
+- Upgraded to `donglora-client` 0.2: all connections now auto-validate via
+  ping-on-connect, rejecting non-DongLoRa serial devices within 200ms.
+- Simplified connection logic — removed manual mux/serial fallback and manual
+  ping; `donglora_client::connect()` handles the full fallback chain and
+  validation internally.
+- Config negotiation detects mux vs serial via transport type instead of
+  string comparison.
+
+### Fixed
+
+- Repository and homepage URLs now point to `github.com/donglora/bridge`
+  (was `swaits/donglora-bridge`).
+- README links updated to `donglora` GitHub org.
+
 ## [0.2.2] - 2026-04-06
 
 ### Fixed

@@ -1,12 +1,12 @@
 [package]
 name = "donglora-bridge"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 authors = ["Stephen Waits <steve@waits.net>"]
 license = "MIT"
 description = "Peer-to-peer LoRa bridge using iroh and DongLoRa"
-repository = "https://github.com/swaits/donglora-bridge"
-homepage = "https://github.com/swaits/donglora-bridge"
+repository = "https://github.com/donglora/bridge"
+homepage = "https://github.com/donglora/bridge"
 keywords = ["lora", "bridge", "gossip", "p2p", "iot"]
 categories = ["network-programming", "command-line-utilities"]
 readme = "README.md"
@@ -14,7 +14,7 @@ rust-version = "1.94.1"
 exclude = [".jj/", ".github/"]
 
 [dependencies]
-donglora-client = "0.1"
+donglora-client = "0.2"
 iroh = "0.97"
 iroh-gossip = "0.97"
 mainline = { version = "6", features = ["async"] }

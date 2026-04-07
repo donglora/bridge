@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use donglora_client::{RadioConfig, Response, Transport};
+use donglora_client::{AnyTransport, RadioConfig, Response, Transport};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -93,30 +93,13 @@ fn connect_and_run(
     let timeout = Duration::from_secs(10);
 
     info!("connecting to dongle...");
-    let (mut client, device) = if let Some(port) = port {
-        let c = donglora_client::connect(Some(port), timeout)?;
-        (c, shorten_path(port))
-    } else if let Ok(c) = donglora_client::connect_mux_auto(timeout) {
-        (c, "mux".to_string())
-    } else {
-        let port_path = donglora_client::find_port().ok_or_else(|| anyhow::anyhow!("no mux or USB dongle found"))?;
-        info!("no mux found, connecting to serial port {port_path}");
-        let c = donglora_client::connect(Some(&port_path), timeout)?;
-        (c, shorten_path(&port_path))
-    };
-    info!("[radio] transport connected: {device}");
-
-    info!("[radio] sending ping...");
-    match client.ping() {
-        Ok(()) => info!("[radio] ping OK"),
-        Err(e) => {
-            info!("[radio] ping FAILED: {e:#}");
-            return Err(e);
-        }
-    }
+    let mut client = donglora_client::connect(port, timeout)?;
+    let is_mux = matches!(client.transport(), AnyTransport::Mux(_));
+    let device = if is_mux { "mux".to_string() } else { port.map_or_else(|| "usb".to_string(), shorten_path) };
+    info!("[radio] connected and validated: {device}");
 
     info!("[radio] negotiating config...");
-    let (active_config, config_source) = match negotiate_config(&mut client, config, &device) {
+    let (active_config, config_source) = match negotiate_config(&mut client, config, is_mux) {
         Ok(result) => {
             info!("[radio] config negotiated: source={:?}, config={}", result.1, format_radio_config(&result.0));
             result
@@ -215,7 +198,7 @@ fn connect_and_run(
 fn negotiate_config<T: Transport>(
     client: &mut donglora_client::Client<T>,
     desired: &RadioConfig,
-    device: &str,
+    is_mux: bool,
 ) -> Result<(RadioConfig, ConfigSource)> {
     info!("[negotiate] get_config...");
     match client.get_config() {
@@ -223,7 +206,7 @@ fn negotiate_config<T: Transport>(
             if configs_match(&cfg, desired) {
                 info!("[negotiate] get_config OK (matches desired): {}", format_radio_config(&cfg));
                 Ok((cfg, ConfigSource::Ours))
-            } else if device == "mux" {
+            } else if is_mux {
                 info!("[negotiate] get_config OK (mux config differs, accepting): {}", format_radio_config(&cfg));
                 Ok((cfg, ConfigSource::Mux))
             } else {
