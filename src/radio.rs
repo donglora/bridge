@@ -56,15 +56,20 @@ fn radio_loop(
     let initial_backoff = Duration::from_millis(250);
     let max_backoff = Duration::from_secs(5);
     let mut backoff = initial_backoff;
+    let mut use_mux_only = false;
 
     loop {
         let started = std::time::Instant::now();
-        match connect_and_run(&config, port.as_deref(), &event_tx, &mut tx_recv) {
-            Ok(()) => {
+        match connect_and_run(&config, port.as_deref(), use_mux_only, &event_tx, &mut tx_recv) {
+            Ok(_was_mux) => {
                 info!("radio thread exiting");
                 return;
             }
-            Err(e) => {
+            Err((was_mux, e)) => {
+                // Session ended with error. Remember transport type for reconnect.
+                if was_mux {
+                    use_mux_only = true;
+                }
                 error!("radio error: {e:#}");
                 let _ = event_tx.blocking_send(RadioEvent::Disconnected);
 
@@ -82,24 +87,47 @@ fn radio_loop(
     }
 }
 
+/// Connect to the dongle and run the radio loop.
+///
+/// Returns `Ok(was_mux)` on clean exit, `Err((was_mux, error))` on failure.
+/// The `was_mux` flag lets the caller know which transport was used so it can
+/// stick to the same transport type on reconnect.
 fn connect_and_run(
     config: &RadioConfig,
     port: Option<&str>,
+    use_mux_only: bool,
     event_tx: &mpsc::Sender<RadioEvent>,
     tx_recv: &mut mpsc::Receiver<Vec<u8>>,
-) -> Result<()> {
+) -> std::result::Result<bool, (bool, anyhow::Error)> {
     // Long initial timeout: the mux serializes commands through the dongle,
     // so our `GetConfig` might have to wait behind other clients' commands.
     let timeout = Duration::from_secs(10);
 
     info!("connecting to dongle...");
-    let mut client = donglora_client::connect(port, timeout)?;
+    let mut client = if use_mux_only {
+        debug!("reconnecting via mux only (previously connected via mux)");
+        donglora_client::connect_mux_auto(timeout).map_err(|e| (true, e))?
+    } else {
+        donglora_client::connect(port, timeout).map_err(|e| (false, e))?
+    };
     let is_mux = matches!(client.transport(), AnyTransport::Mux(_));
     let device = if is_mux { "mux".to_string() } else { port.map_or_else(|| "usb".to_string(), shorten_path) };
     info!("[radio] connected and validated: {device}");
 
+    // Run the session. Map Result<()> to include the is_mux flag.
+    run_session(&mut client, config, is_mux, &device, event_tx, tx_recv).map(|()| is_mux).map_err(|e| (is_mux, e))
+}
+
+fn run_session(
+    client: &mut donglora_client::Client<AnyTransport>,
+    config: &RadioConfig,
+    is_mux: bool,
+    device: &str,
+    event_tx: &mpsc::Sender<RadioEvent>,
+    tx_recv: &mut mpsc::Receiver<Vec<u8>>,
+) -> Result<()> {
     info!("[radio] negotiating config...");
-    let (active_config, config_source) = match negotiate_config(&mut client, config, is_mux) {
+    let (active_config, config_source) = match negotiate_config(client, config, is_mux) {
         Ok(result) => {
             info!("[radio] config negotiated: source={:?}, config={}", result.1, format_radio_config(&result.0));
             result
@@ -119,7 +147,7 @@ fn connect_and_run(
         }
     }
 
-    let _ = event_tx.blocking_send(RadioEvent::Connected(active_config, config_source, device));
+    let _ = event_tx.blocking_send(RadioEvent::Connected(active_config, config_source, device.to_string()));
 
     // Set a short timeout so we can interleave RX and TX.
     client.transport_mut().set_timeout(Duration::from_millis(100))?;

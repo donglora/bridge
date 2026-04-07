@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.1] - 2026-04-07
+
+### Fixed
+
+- **Sticky mux reconnect.** Once the bridge connects via mux, all subsequent
+  reconnects use mux-only mode (`connect_mux_auto`). Previously, each reconnect
+  re-ran the full mux→USB fallback chain, which could steal the serial port
+  from the mux during a brief disconnect.
+
 ## [0.3.0] - 2026-04-07
 
 ### Changed
