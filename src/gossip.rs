@@ -22,7 +22,7 @@ use mainline::{Dht, MutableItem, SigningKey};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::packet::GossipFrame;
 
@@ -31,14 +31,27 @@ use crate::packet::GossipFrame;
 /// Conservative cap to stay under BEP44's 1000-byte value limit.
 const MAX_DHT_PEERS: usize = 27;
 
-/// DHT heartbeat interval when connected (base, before jitter). 5 minutes
-/// balances freshness against DHT write amplification — connected nodes already
-/// have live gossip links and only need DHT for newcomer discovery.
-const DHT_HEARTBEAT_SECS: u64 = 300;
+/// DHT heartbeat interval (base, before jitter). Each bridge periodically
+/// publishes `[self] + live_neighbors` as a blind overwrite. Any live bridge
+/// publishing at this cadence guarantees that the DHT record is overwritten
+/// with a fresh snapshot of a real, connected sub-swarm within this window —
+/// so stale entries from crashed / restarted peers age out within one cycle.
+const DHT_HEARTBEAT_SECS: u64 = 60;
 
-/// Maximum random jitter added to heartbeat interval. Prevents synchronized
-/// publish storms when multiple bridges start simultaneously.
-const DHT_HEARTBEAT_JITTER_SECS: u64 = 60;
+/// Maximum random jitter added to heartbeat. Prevents synchronized publish
+/// storms when multiple bridges start simultaneously.
+const DHT_HEARTBEAT_JITTER_SECS: u64 = 15;
+
+/// DHT read interval while we have no neighbors. Stays aggressive so two
+/// freshly-started bridges find each other quickly.
+const DHT_LONELY_READ_SECS: u64 = 3;
+
+/// How long to try dialing DHT-discovered peers before we give up and publish
+/// ourselves alone. If we connect to at least one peer in this window we
+/// publish `[self, neighbors...]` right away. If we don't, we publish `[self]`
+/// so newcomers find us — but we delay this so we don't overwrite a
+/// potentially useful DHT record with just our own lonely entry.
+const DHT_BOOTSTRAP_GRACE_SECS: u64 = 10;
 
 // ── Key derivation ───────────────────────────────────────────────
 
@@ -321,12 +334,23 @@ fn spawn_receiver(
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        loop {
+        // Log a hard warning if the receiver stream ever ends — this is the
+        // "silent one-way gossip" failure mode. Track why it exited so the
+        // log tells us whether it was a stream-end (None), an error
+        // (Some(Err)), or a cancel.
+        let exit_reason: &'static str = loop {
             let event = tokio::select! {
                 event = receiver.next() => event,
-                () = cancel.cancelled() => break,
+                () = cancel.cancelled() => break "cancelled",
             };
-            let Some(Ok(event)) = event else { break };
+            let event = match event {
+                None => break "stream ended (receiver closed)",
+                Some(Err(e)) => {
+                    error!("gossip receiver error: {e:#}");
+                    break "receiver error";
+                }
+                Some(Ok(ev)) => ev,
+            };
             match event {
                 Event::Received(msg) => {
                     if let Some(frame) = GossipFrame::decode(&msg.content) {
@@ -364,8 +388,15 @@ fn spawn_receiver(
                     warn!("gossip receiver lagged — some messages were dropped");
                 }
             }
+        };
+        // A shutdown cancel is expected; any other exit means we silently
+        // stopped receiving gossip. That's the "one-way bridge" bug —
+        // broadcast still works because spawn_broadcaster is independent.
+        if exit_reason == "cancelled" {
+            debug!("gossip receiver stopped ({exit_reason})");
+        } else {
+            error!("gossip receiver STOPPED ({exit_reason}) — this bridge will no longer receive from the swarm",);
         }
-        debug!("gossip receiver stopped");
     });
 }
 
@@ -391,24 +422,25 @@ fn spawn_broadcaster(
     });
 }
 
-/// DHT poll interval while alone. 3 seconds is aggressive but reads are cheap
-/// (single DHT GET) and fast discovery matters when two nodes start together.
-const DHT_ALONE_READ_SECS: u64 = 3;
-
-/// How often a lonely node publishes (merge-only, never destructive). 30 seconds
-/// is much slower than reads because DHT PUT is heavier and a lonely node only
-/// adds itself to the peer list.
-const DHT_ALONE_PUBLISH_SECS: u64 = 30;
-
-/// Periodically interact with the DHT to discover and share peers.
+/// Periodically publish `[self] + live_neighbors` to the DHT and read it to
+/// discover new peers.
 ///
-/// Strategy:
-/// - **Alone:** Read every 3s (cheap). Publish every 30s via merge — reads
-///   existing data first, appends ourselves, writes back. Two fresh nodes
-///   both doing this will eventually see each other. Never blindly overwrites.
-/// - **Connected:** Read + publish on relaxed 5-min schedule. We have
-///   valuable neighbor info to share.
-/// - **Transition to connected:** Publish immediately.
+/// Strategy — deliberately simple:
+/// 1. **Startup**: read DHT, try to join discovered peers. Do NOT publish
+///    yet — we don't know if any of them are still alive, and publishing
+///    `[self]` alone would overwrite a potentially useful record.
+/// 2. **Bootstrap grace** (10 s): keep reading fast (every
+///    `DHT_LONELY_READ_SECS`) looking for peers to connect to. If a
+///    `NeighborUp` fires inside this window, publish immediately with the
+///    live neighbor set. If nothing shows up, publish `[self]` so anyone
+///    else joining finds us.
+/// 3. **Steady state**: publish `[self, neighbors...]` every
+///    `DHT_HEARTBEAT_SECS` (+ jitter), a blind overwrite. Any live bridge
+///    doing this naturally ages out crashed/stale peers from the DHT
+///    record within one cycle.
+/// 4. **Re-read cadence**: fast (`DHT_LONELY_READ_SECS`) while
+///    `neighbor_count == 0`, relaxed (= heartbeat interval) once
+///    connected.
 #[allow(clippy::too_many_arguments)]
 fn spawn_dht_heartbeat(
     my_id: PublicKey,
@@ -430,27 +462,29 @@ fn spawn_dht_heartbeat(
         };
 
         let pub_key_bytes = signing_key.verifying_key().to_bytes();
+        let mut last_publish: Option<Instant> = None;
         let mut was_alone = true;
-        let mut last_publish = Instant::now();
+        let started = Instant::now();
 
-        // Initial: read to discover existing peers, then merge-publish ourselves.
+        // Step 1: read the DHT to find peers to dial.
         dht_read_and_join(&dht, &my_id, &pub_key_bytes, &salt, &gossip_sender, &state).await;
-        dht_publish(&dht, &my_id, &signing_key, &salt, &pub_key_bytes, &neighbors, &state).await;
 
         loop {
             let alone = neighbor_count.load(Ordering::Relaxed) == 0;
 
-            // Transition: alone → connected. Publish immediately.
+            // Transition: alone → connected. Publish immediately with live
+            // neighbors so anyone who was about to dial us-as-lonely finds
+            // the full picture.
             if was_alone && !alone {
                 info!("first neighbor joined — publishing to DHT");
-                dht_publish(&dht, &my_id, &signing_key, &salt, &pub_key_bytes, &neighbors, &state).await;
-                last_publish = Instant::now();
+                dht_publish(&dht, &my_id, &signing_key, &salt, &neighbors, &state).await;
+                last_publish = Some(Instant::now());
             }
             was_alone = alone;
 
-            // Sleep: fast reads while alone, relaxed when connected.
+            // Sleep: fast reads while lonely, relaxed once connected.
             let sleep_dur = if alone {
-                Duration::from_secs(DHT_ALONE_READ_SECS)
+                Duration::from_secs(DHT_LONELY_READ_SECS)
             } else {
                 let jitter = rand::random::<u64>() % DHT_HEARTBEAT_JITTER_SECS.max(1);
                 Duration::from_secs(DHT_HEARTBEAT_SECS + jitter)
@@ -461,18 +495,21 @@ fn spawn_dht_heartbeat(
                 () = cancel.cancelled() => break,
             }
 
-            // Always read — cheap, discovers peers to join.
+            // Always read — cheap, keeps fresh peers coming in.
             dht_read_and_join(&dht, &my_id, &pub_key_bytes, &salt, &gossip_sender, &state).await;
 
-            // Publish cadence depends on state.
-            let publish_interval = if alone {
-                Duration::from_secs(DHT_ALONE_PUBLISH_SECS)
-            } else {
-                Duration::from_secs(DHT_HEARTBEAT_SECS)
-            };
-            if last_publish.elapsed() >= publish_interval {
-                dht_publish(&dht, &my_id, &signing_key, &salt, &pub_key_bytes, &neighbors, &state).await;
-                last_publish = Instant::now();
+            // Steady-state: publish on every heartbeat tick once we've
+            // published at least once. Pre-first-publish, hold off until
+            // either a neighbor appears OR the bootstrap grace elapses —
+            // this avoids wiping a potentially-useful DHT record with
+            // just our lonely [self] entry on startup.
+            let should_publish = last_publish.map_or_else(
+                || !alone || started.elapsed() >= Duration::from_secs(DHT_BOOTSTRAP_GRACE_SECS),
+                |t| t.elapsed() >= Duration::from_secs(DHT_HEARTBEAT_SECS),
+            );
+            if should_publish {
+                dht_publish(&dht, &my_id, &signing_key, &salt, &neighbors, &state).await;
+                last_publish = Some(Instant::now());
             }
         }
         debug!("DHT heartbeat stopped");
@@ -503,44 +540,30 @@ async fn dht_read_and_join(
     }
 }
 
+/// Publish `[self] + live_neighbors` to the DHT as a blind overwrite.
+///
+/// No merge with existing DHT content. Stale peers age out naturally
+/// because every live bridge publishes a snapshot of its actual live
+/// connections within `DHT_HEARTBEAT_SECS`, and higher-seq records win.
 async fn dht_publish(
     dht: &AsyncDht,
     my_id: &PublicKey,
     signing_key: &SigningKey,
     salt: &[u8; 20],
-    pub_key_bytes: &[u8; 32],
     neighbors: &Arc<Mutex<HashSet<PublicKey>>>,
     state: &Arc<Mutex<SwarmState>>,
 ) {
-    let has_neighbors = neighbors.lock().is_ok_and(|n| !n.is_empty());
-
-    let mut seen = HashSet::new();
     let mut peer_list: Vec<[u8; 32]> = Vec::with_capacity(MAX_DHT_PEERS);
-
-    // Always include ourselves.
     peer_list.push(*my_id.as_bytes());
-    seen.insert(*my_id.as_bytes());
 
-    if has_neighbors {
-        // Connected: publish authoritative data — self + live neighbors only.
-        // This purges dead/stale peers from the DHT. We know who's alive
-        // because they're our active gossip neighbors.
-        if let Ok(n) = neighbors.lock() {
-            for id in n.iter() {
-                if seen.insert(*id.as_bytes()) && peer_list.len() < MAX_DHT_PEERS {
-                    peer_list.push(*id.as_bytes());
-                }
+    // Snapshot current live neighbors — those we have an active gossip
+    // connection to right now. No inherited junk from prior DHT content.
+    if let Ok(n) = neighbors.lock() {
+        for id in n.iter() {
+            if peer_list.len() >= MAX_DHT_PEERS {
+                break;
             }
-        }
-    } else {
-        // Alone: merge-publish — read existing DHT data first, add ourselves,
-        // preserve other peers. We don't know who's alive so we can't purge.
-        if let Some(record) = dht.get_mutable_most_recent(pub_key_bytes, Some(salt)).await {
-            for existing in decode_peer_list(record.value()) {
-                if seen.insert(*existing.as_bytes()) && peer_list.len() < MAX_DHT_PEERS {
-                    peer_list.push(*existing.as_bytes());
-                }
-            }
+            peer_list.push(*id.as_bytes());
         }
     }
 

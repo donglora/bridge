@@ -58,14 +58,11 @@ pub fn run_wizard(config_path: &Path, existing: Option<&Config>) -> Result<()> {
     let sync_word_str = prompt_default("Sync Word", &sw_default)?;
     let sync_word = parse_sync_word(&sync_word_str)?;
 
-    let tx_power = prompt_default("TX Power (dBm or 'max')", &radio.tx_power)?;
+    let tx_power_default = format!("{}", radio.tx_power_dbm);
+    let tx_power_dbm: i8 = prompt_parse("TX Power (dBm)", &tx_power_default)?;
 
     let pre_default = format!("{}", radio.preamble);
     let preamble: u16 = prompt_parse("Preamble", &pre_default)?;
-
-    let cad_default = if radio.cad { "on" } else { "off" };
-    let cad_str = prompt_default("CAD", cad_default)?;
-    let cad = matches!(cad_str.to_lowercase().as_str(), "on" | "true" | "yes" | "1");
 
     let port_default = radio.port.as_deref().unwrap_or("auto");
     let port_str = prompt_default("Serial Port", port_default)?;
@@ -81,9 +78,8 @@ pub fn run_wizard(config_path: &Path, existing: Option<&Config>) -> Result<()> {
             spreading_factor,
             coding_rate,
             sync_word,
-            tx_power,
+            tx_power_dbm,
             preamble,
-            cad,
         },
         bridge: BridgeSection {
             passphrase,
@@ -92,6 +88,7 @@ pub fn run_wizard(config_path: &Path, existing: Option<&Config>) -> Result<()> {
             rate_limit_pps: bridge.rate_limit_pps,
             log_file: bridge.log_file,
         },
+        tx: existing.map(|c| c.tx.clone()).unwrap_or_default(),
     };
 
     write_config(config_path, &cfg)?;

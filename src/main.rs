@@ -71,17 +71,24 @@ async fn main() -> Result<()> {
     info!("donglora-bridge starting, ephemeral id: {}", node_id.fmt_short());
 
     // Parse radio config.
-    let radio_config = cfg.radio.to_radio_config()?;
+    let radio_config = cfg.radio.to_lora_config()?;
+    let retry_policy = cfg.tx.to_retry_policy()?;
 
     // Derive passphrase keys.
     let keys = PassphraseKeys::derive(&cfg.bridge.passphrase);
     info!("topic: {}", hex::encode(&keys.topic_id.as_bytes()[..8]));
 
     // Create rate limiter.
+    let cr_denom: u8 = match radio_config.cr {
+        donglora_client::LoRaCodingRate::Cr4_5 => 5,
+        donglora_client::LoRaCodingRate::Cr4_6 => 6,
+        donglora_client::LoRaCodingRate::Cr4_7 => 7,
+        donglora_client::LoRaCodingRate::Cr4_8 => 8,
+    };
     let rate_limiter = RateLimiter::from_radio_config(
         radio_config.sf,
         radio_config.bw,
-        radio_config.cr,
+        cr_denom,
         radio_config.preamble_len,
         cfg.bridge.rate_limit_pps,
     );
@@ -92,7 +99,7 @@ async fn main() -> Result<()> {
     let swarm = Arc::new(swarm);
 
     // Start radio.
-    let (radio_event_rx, radio_tx) = radio::spawn(radio_config, cfg.radio.port.clone())?;
+    let (radio_event_rx, radio_tx, _radio_handle) = radio::spawn(radio_config, cfg.radio.port.clone(), retry_policy)?;
 
     // Stats + log channel + radio config watch.
     let stats = Arc::new(Stats::default());
@@ -160,6 +167,13 @@ async fn main() -> Result<()> {
     // Run TUI or headless.
     if cli.log_only {
         info!("running in headless mode");
+        // In TUI mode the TUI drains `log_rx`; in headless mode nobody
+        // does unless we spawn a consumer. Without this, the router's
+        // bounded log channel backs up and router throughput stalls.
+        // Emit each entry at INFO level so operators can see what the
+        // bridge is bridging (RX/TX/drop/retry).
+        let log_cancel = cancel.clone();
+        tokio::spawn(headless_packet_logger(log_rx, log_cancel));
         cancel.cancelled().await;
     } else {
         let terminal = tui::run(config_watch_rx, swarm.clone(), stats, log_rx, cancel.clone(), start_time);
@@ -180,6 +194,91 @@ async fn main() -> Result<()> {
     info!("donglora-bridge stopped");
 
     Ok(())
+}
+
+/// Drain the router's packet-log channel in headless mode and emit
+/// tracing events so `--log-only` output shows every bridged / dropped /
+/// retried packet. Exits when `cancel` fires or the channel closes.
+async fn headless_packet_logger(mut log_rx: mpsc::Receiver<router::PacketLogEntry>, cancel: CancellationToken) {
+    use router::{PacketAction, PacketDirection, TxRetryState};
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            entry = log_rx.recv() => {
+                let Some(e) = entry else { return; };
+                let dir = match e.direction {
+                    PacketDirection::RadioIn => "RF→NET",
+                    PacketDirection::GossipIn => "NET→RF",
+                };
+                let hash_str = hex::encode(&e.hash[..4]);
+                let rssi_str = e.rssi.map_or_else(|| "-".to_string(), |r| r.to_string());
+                let snr_str = e.snr.map_or_else(|| "-".to_string(), |s| s.to_string());
+
+                // TX-retry lifecycle wins over the plain action label when set.
+                if let Some(r) = e.tx_retry {
+                    match r.state {
+                        TxRetryState::Retrying(reason) => {
+                            tracing::info!(
+                                target: "packet",
+                                "{} retry  hash={} attempt={}/{} reason={}",
+                                dir, hash_str, r.attempt, r.total_attempts, reason,
+                            );
+                        }
+                        TxRetryState::Succeeded if r.attempt > 1 => {
+                            tracing::info!(
+                                target: "packet",
+                                "{} sent   hash={} size={}B attempts={}/{}",
+                                dir, hash_str, e.size, r.attempt, r.total_attempts,
+                            );
+                        }
+                        TxRetryState::Failed => {
+                            tracing::warn!(
+                                target: "packet",
+                                "{} FAILED hash={} size={}B attempts={}/{}",
+                                dir, hash_str, e.size, r.attempt, r.total_attempts,
+                            );
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                match e.action {
+                    PacketAction::Bridged => {
+                        tracing::info!(
+                            target: "packet",
+                            "{} bridged hash={} size={}B rssi={} snr={}",
+                            dir, hash_str, e.size, rssi_str, snr_str,
+                        );
+                    }
+                    PacketAction::DroppedDedup => {
+                        // Log at INFO, not DEBUG — a run of dedup lines is
+                        // proof of bidirectional gossip flow. Hiding it
+                        // masks whether we're actually hearing peers.
+                        tracing::info!(
+                            target: "packet",
+                            "{} dedup   hash={} size={}B rssi={} snr={}",
+                            dir, hash_str, e.size, rssi_str, snr_str,
+                        );
+                    }
+                    PacketAction::DroppedRateLimit => {
+                        tracing::warn!(
+                            target: "packet",
+                            "{} ratelim hash={} size={}B",
+                            dir, hash_str, e.size,
+                        );
+                    }
+                    PacketAction::DroppedQueueFull => {
+                        tracing::warn!(
+                            target: "packet",
+                            "{} QFULL   hash={} size={}B",
+                            dir, hash_str, e.size,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn setup_logging(log_only: bool, cfg: &config::Config) {

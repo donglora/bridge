@@ -13,14 +13,14 @@ use tracing::{debug, warn};
 
 use crate::gossip::GossipEvent;
 use crate::packet::{GossipFrame, content_hash};
-use crate::radio::{ConfigSource, RadioEvent};
+use crate::radio::{ConfigSource, RadioEvent, TxRequest, TxRetryReason};
 use crate::rate_limit::RateLimiter;
 
 /// Active radio config info, sent to the TUI via watch channel.
 #[derive(Debug, Clone)]
 pub struct RadioConfigInfo {
-    pub active: donglora_client::RadioConfig,
-    pub requested: donglora_client::RadioConfig,
+    pub active: donglora_client::LoRaConfig,
+    pub requested: donglora_client::LoRaConfig,
     pub source: ConfigSource,
     pub device: String,
     pub connected: bool,
@@ -36,6 +36,29 @@ pub struct PacketLogEntry {
     pub snr: Option<i16>,
     pub rssi: Option<i16>,
     pub action: PacketAction,
+    /// When set, indicates this entry is a TX-attempt update: `Some((attempt, total))`.
+    pub tx_retry: Option<TxRetryInfo>,
+}
+
+/// Per-attempt retry metadata attached to a TX `PacketLogEntry`.
+#[derive(Debug, Clone, Copy)]
+pub struct TxRetryInfo {
+    pub attempt: u8,
+    pub total_attempts: u8,
+    pub state: TxRetryState,
+}
+
+/// State a TX entry is currently in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxRetryState {
+    /// First attempt in flight.
+    InFlight,
+    /// A previous attempt failed; this attempt is a retry.
+    Retrying(TxRetryReason),
+    /// Final success, possibly after retries.
+    Succeeded,
+    /// All attempts exhausted; terminal failure.
+    Failed,
 }
 
 /// Which side the packet arrived from.
@@ -83,6 +106,11 @@ pub struct Stats {
     pub dropped_queue: AtomicU64,
     pub neighbor_count: AtomicU64,
     pub radio_connected: AtomicU64, // 0 = disconnected, 1 = connected
+    /// Cumulative TX retries across the bridge lifetime (each retry after
+    /// the first attempt increments by 1).
+    pub tx_retries: AtomicU64,
+    /// TX calls that exhausted the retry policy.
+    pub tx_failures: AtomicU64,
 }
 
 impl Stats {
@@ -98,6 +126,8 @@ impl Stats {
             dropped_queue: self.dropped_queue.load(Ordering::Relaxed),
             neighbor_count: self.neighbor_count.load(Ordering::Relaxed),
             radio_connected: self.radio_connected.load(Ordering::Relaxed) != 0,
+            tx_retries: self.tx_retries.load(Ordering::Relaxed),
+            tx_failures: self.tx_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -114,6 +144,8 @@ pub struct StatsSnapshot {
     pub dropped_queue: u64,
     pub neighbor_count: u64,
     pub radio_connected: bool,
+    pub tx_retries: u64,
+    pub tx_failures: u64,
 }
 
 /// Time-bounded dedup cache.
@@ -153,10 +185,10 @@ pub async fn run(
     our_id: PublicKey,
     dedup_window: Duration,
     tx_queue_size: usize,
-    requested_radio_config: donglora_client::RadioConfig,
+    requested_radio_config: donglora_client::LoRaConfig,
     mut rate_limiter: RateLimiter,
     mut radio_rx: mpsc::Receiver<RadioEvent>,
-    radio_tx: mpsc::Sender<Vec<u8>>,
+    radio_tx: mpsc::Sender<TxRequest>,
     mut gossip_rx: mpsc::Receiver<GossipEvent>,
     gossip_tx: mpsc::Sender<GossipFrame>,
     stats: &Stats,
@@ -164,6 +196,7 @@ pub async fn run(
     config_tx: tokio::sync::watch::Sender<RadioConfigInfo>,
 ) {
     let mut dedup = DedupCache::new(dedup_window);
+    let mut next_tx_seq: u64 = 0;
     let mut tx_queue: VecDeque<Vec<u8>> = VecDeque::with_capacity(tx_queue_size);
     let mut last_cleanup = Instant::now();
     let cleanup_interval = Duration::from_secs(30);
@@ -195,6 +228,7 @@ pub async fn run(
                                 snr: Some(pkt.snr),
                                 rssi: Some(pkt.rssi),
                                 action: PacketAction::DroppedDedup,
+                                tx_retry: None,
                             }).await;
                             continue;
                         }
@@ -212,6 +246,7 @@ pub async fn run(
                             snr: Some(pkt.snr),
                             rssi: Some(pkt.rssi),
                             action: PacketAction::Bridged,
+                            tx_retry: None,
                         }).await;
                     }
                     RadioEvent::Connected(active_config, source, device) => {
@@ -227,6 +262,67 @@ pub async fn run(
                     RadioEvent::Disconnected => {
                         stats.radio_connected.store(0, Ordering::Relaxed);
                         config_tx.send_modify(|info| info.connected = false);
+                    }
+                    RadioEvent::TxAttempt { .. } => {
+                        // No log entry: the GossipIn Bridged row that enqueued
+                        // this TX already represents it. Only retries /
+                        // failures produce follow-up rows.
+                    }
+                    RadioEvent::TxRetry { seq, attempt_that_failed, total_attempts, reason, backoff_ms: _ } => {
+                        stats.tx_retries.fetch_add(1, Ordering::Relaxed);
+                        let _ = log_tx.send(PacketLogEntry {
+                            timestamp: Instant::now(),
+                            hash: tx_seq_hash(seq),
+                            direction: PacketDirection::GossipIn,
+                            size: 0,
+                            snr: None,
+                            rssi: None,
+                            action: PacketAction::Bridged,
+                            tx_retry: Some(TxRetryInfo {
+                                attempt: attempt_that_failed.saturating_add(1),
+                                total_attempts,
+                                state: TxRetryState::Retrying(reason),
+                            }),
+                        }).await;
+                    }
+                    RadioEvent::TxSucceeded { seq, attempts_used, final_airtime_us: _, size } => {
+                        stats.radio_tx.fetch_add(1, Ordering::Relaxed);
+                        // Only emit a success row if retries were involved —
+                        // otherwise the original GossipIn row covers it.
+                        if attempts_used > 1 {
+                            let _ = log_tx.send(PacketLogEntry {
+                                timestamp: Instant::now(),
+                                hash: tx_seq_hash(seq),
+                                direction: PacketDirection::GossipIn,
+                                size,
+                                snr: None,
+                                rssi: None,
+                                action: PacketAction::Bridged,
+                                tx_retry: Some(TxRetryInfo {
+                                    attempt: attempts_used,
+                                    total_attempts: attempts_used,
+                                    state: TxRetryState::Succeeded,
+                                }),
+                            }).await;
+                        }
+                    }
+                    RadioEvent::TxFailed { seq, attempts_used, reason, size } => {
+                        stats.tx_failures.fetch_add(1, Ordering::Relaxed);
+                        warn!("TX #{seq} exhausted retries: {reason}");
+                        let _ = log_tx.send(PacketLogEntry {
+                            timestamp: Instant::now(),
+                            hash: tx_seq_hash(seq),
+                            direction: PacketDirection::GossipIn,
+                            size,
+                            snr: None,
+                            rssi: None,
+                            action: PacketAction::Bridged,
+                            tx_retry: Some(TxRetryInfo {
+                                attempt: attempts_used,
+                                total_attempts: attempts_used,
+                                state: TxRetryState::Failed,
+                            }),
+                        }).await;
                     }
                 }
             }
@@ -250,6 +346,7 @@ pub async fn run(
                                 snr: Some(frame.snr),
                                 rssi: Some(frame.rssi),
                                 action: PacketAction::DroppedDedup,
+                                tx_retry: None,
                             }).await;
                             continue;
                         }
@@ -266,6 +363,7 @@ pub async fn run(
                                 snr: Some(frame.snr),
                                 rssi: Some(frame.rssi),
                                 action: PacketAction::DroppedRateLimit,
+                                tx_retry: None,
                             }).await;
                             continue;
                         }
@@ -282,6 +380,7 @@ pub async fn run(
                                 snr: Some(frame.snr),
                                 rssi: Some(frame.rssi),
                                 action: PacketAction::DroppedQueueFull,
+                                tx_retry: None,
                             }).await;
                             continue;
                         }
@@ -295,6 +394,7 @@ pub async fn run(
                             snr: Some(frame.snr),
                             rssi: Some(frame.rssi),
                             action: PacketAction::Bridged,
+                            tx_retry: None,
                         }).await;
                     }
                     GossipEvent::NeighborChanged(count) => {
@@ -305,14 +405,37 @@ pub async fn run(
             }
         }
 
-        // Drain TX queue to radio.
+        // Drain TX queue to the async radio task. radio_tx is a bounded
+        // channel; if the radio task is busy we just wait on the next
+        // loop iteration rather than blocking here.
         while let Some(payload) = tx_queue.pop_front() {
-            stats.radio_tx.fetch_add(1, Ordering::Relaxed);
-            if radio_tx.send(payload).await.is_err() {
+            let seq = {
+                next_tx_seq = next_tx_seq.wrapping_add(1);
+                next_tx_seq
+            };
+            if radio_tx.send(TxRequest { seq, data: payload }).await.is_err() {
                 break;
             }
         }
     }
+}
+
+/// Build a stable per-TX "hash" for packet-log correlation. Not a real
+/// content hash — just a 32-byte encoding of the seq so the TUI can
+/// index/update log rows by it.
+const fn tx_seq_hash(seq: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[0] = 0x01; // tag marking this as a TX-seq pseudo-hash
+    let bytes = seq.to_le_bytes();
+    out[1] = bytes[0];
+    out[2] = bytes[1];
+    out[3] = bytes[2];
+    out[4] = bytes[3];
+    out[5] = bytes[4];
+    out[6] = bytes[5];
+    out[7] = bytes[6];
+    out[8] = bytes[7];
+    out
 }
 
 #[cfg(test)]

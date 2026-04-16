@@ -1,6 +1,6 @@
 [package]
 name = "donglora-bridge"
-version = "0.3.1"
+version = "1.0.0-alpha.1"
 edition = "2024"
 authors = ["Stephen Waits <steve@waits.net>"]
 license = "MIT"
@@ -14,7 +14,7 @@ rust-version = "1.94.1"
 exclude = [".jj/", ".github/"]
 
 [dependencies]
-donglora-client = "0.2"
+donglora-client = { path = "../client-rs", version = "1.0.0-alpha.1" }
 iroh = "0.97"
 iroh-gossip = "0.97"
 mainline = { version = "6", features = ["async"] }

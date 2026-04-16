@@ -23,7 +23,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::gossip::Gossip;
 use crate::radio::ConfigSource;
-use crate::router::{PacketAction, PacketDirection, PacketLogEntry, RadioConfigInfo, Stats, StatsSnapshot};
+use crate::router::{
+    PacketAction, PacketDirection, PacketLogEntry, RadioConfigInfo, Stats, StatsSnapshot, TxRetryState,
+};
 
 const TICK_RATE: Duration = Duration::from_millis(250);
 const MAX_LOG_ENTRIES: usize = 200;
@@ -366,13 +368,16 @@ fn draw_radio(frame: &mut ratatui::Frame, area: Rect, config_info: &RadioConfigI
 
     let freq_mhz = f64::from(a.freq_hz) / 1_000_000.0;
     let bw_str = crate::radio::format_bandwidth(a.bw);
-    let power_str = if a.tx_power_dbm == donglora_client::TX_POWER_MAX {
-        "max".to_string()
-    } else {
-        format!("{} dBm", a.tx_power_dbm)
-    };
+    let power_str = format!("{} dBm", a.tx_power_dbm);
     let preamble = if a.preamble_len == 0 { 16 } else { a.preamble_len };
-    let cad = if a.cad != 0 { "on" } else { "off" };
+    let cr_denom = |c: donglora_client::LoRaCodingRate| -> u8 {
+        match c {
+            donglora_client::LoRaCodingRate::Cr4_5 => 5,
+            donglora_client::LoRaCodingRate::Cr4_6 => 6,
+            donglora_client::LoRaCodingRate::Cr4_7 => 7,
+            donglora_client::LoRaCodingRate::Cr4_8 => 8,
+        }
+    };
 
     // Dim values when disconnected; highlight mux mismatches when connected.
     let val_color = if connected { C_ACCENT } else { C_LABEL };
@@ -394,11 +399,10 @@ fn draw_radio(frame: &mut ratatui::Frame, area: Rect, config_info: &RadioConfigI
         cf("Freq", format!("{freq_mhz:.3} MHz"), a.freq_hz == r.freq_hz),
         cf("BW", bw_str.to_string(), a.bw == r.bw),
         cf("SF", format!("{}", a.sf), a.sf == r.sf),
-        cf("CR", format!("4/{}", a.cr), a.cr == r.cr),
+        cf("CR", format!("4/{}", cr_denom(a.cr)), a.cr == r.cr),
         cf("Sync", format!("0x{:04X}", a.sync_word), a.sync_word == r.sync_word),
         cf("TX", power_str, a.tx_power_dbm == r.tx_power_dbm),
         cf("Preamble", format!("{preamble}"), a.preamble_len == r.preamble_len),
-        cf("CAD", cad.to_string(), a.cad == r.cad),
     ];
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -430,6 +434,11 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, stats: &StatsSnapshot, sta
         s("Deduped", stats.dedup_hits, C_DEDUP),
         s("Rate lim", stats.rate_limit_drops, C_RATE_DROP),
         s("Q drop", stats.dropped_queue, C_QUEUE_DROP),
+        // CAD-busy retries tally (per spec §6.10). Yellow when accumulating,
+        // dim when quiet.
+        s("TX retry", stats.tx_retries, if stats.tx_retries > 0 { C_RATE_DROP } else { C_LABEL }),
+        // TX calls that exhausted the retry policy and gave up.
+        s("TX fail", stats.tx_failures, if stats.tx_failures > 0 { C_QUEUE_DROP } else { C_LABEL }),
     ];
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -447,6 +456,11 @@ fn draw_log(frame: &mut ratatui::Frame, area: Rect, entries: &[PacketLogEntry]) 
 
     // Fixed column widths: Age=5 Hash=8 RF=4 Net=4 Size=6 RSSI=6 SNR=5 Act=5
     // Every span (header and data) uses the same width per column.
+    //
+    // `Act` stays at 5 chars so the full row fits inside the Packet Log
+    // panel. Retry labels compress to 4 chars (`↻3/3`, `✓3/3`, `✗3/3`) —
+    // plain drop labels (`DUP`, `FULL`, `RATE`) right-align within the
+    // same width.
     let hdr = Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD);
     let header = Line::from(vec![
         Span::styled(format!("{:>5}", "Age"), hdr),
@@ -488,11 +502,35 @@ fn draw_log(frame: &mut ratatui::Frame, area: Rect, entries: &[PacketLogEntry]) 
             ),
         };
 
-        let action_color = match e.action {
-            PacketAction::Bridged => C_LABEL,
-            PacketAction::DroppedDedup => C_DEDUP,
-            PacketAction::DroppedQueueFull => C_QUEUE_DROP,
-            PacketAction::DroppedRateLimit => C_RATE_DROP,
+        // TX retry state wins over the plain action label when present —
+        // TX-log entries use the retry tag to carry through retry / success /
+        // failure state. Otherwise fall back to the generic action.
+        let (action_text, action_color) = if let Some(r) = e.tx_retry {
+            // Compact `↻N/M` / `✓N/M` / `✗N/M` — no space between glyph
+            // and counter, so it fits in the 4-char data slot.
+            match r.state {
+                TxRetryState::Retrying(_) => (format!("↻{}/{}", r.attempt, r.total_attempts), C_RATE_DROP),
+                TxRetryState::Succeeded => (format!("✓{}/{}", r.attempt, r.total_attempts), C_NET_TX),
+                TxRetryState::Failed => (format!("✗{}/{}", r.attempt, r.total_attempts), C_QUEUE_DROP),
+                // `InFlight` isn't currently emitted by the router, but keep
+                // a graceful fallback so any future debug wiring doesn't
+                // break rendering.
+                TxRetryState::InFlight => (String::new(), C_LABEL),
+            }
+        } else {
+            let color = match e.action {
+                PacketAction::Bridged => C_LABEL,
+                PacketAction::DroppedDedup => C_DEDUP,
+                PacketAction::DroppedQueueFull => C_QUEUE_DROP,
+                PacketAction::DroppedRateLimit => C_RATE_DROP,
+            };
+            let label = match e.action {
+                PacketAction::Bridged => "",
+                PacketAction::DroppedDedup => "DUP",
+                PacketAction::DroppedQueueFull => "FULL",
+                PacketAction::DroppedRateLimit => "RATE",
+            };
+            (label.to_string(), color)
         };
 
         let rssi_span = match e.rssi {
@@ -504,13 +542,9 @@ fn draw_log(frame: &mut ratatui::Frame, area: Rect, entries: &[PacketLogEntry]) 
             None => Span::styled(format!("{:>5}", "-"), Style::default().fg(C_LABEL)),
         };
 
-        let action_str = match e.action {
-            PacketAction::Bridged => "",
-            PacketAction::DroppedDedup => "DUP",
-            PacketAction::DroppedQueueFull => "FULL",
-            PacketAction::DroppedRateLimit => "RATE",
-        };
-        let action_span = Span::styled(format!(" {action_str:>4}"), Style::default().fg(action_color));
+        // Leading space + right-aligned 4-char data = 5 total, matching
+        // the `Act` header.
+        let action_span = Span::styled(format!(" {action_text:>4}"), Style::default().fg(action_color));
 
         let size_str = format!("{}B", e.size);
         lines.push(Line::from(vec![
@@ -700,6 +734,8 @@ mod tests {
             dropped_queue: 0,
             neighbor_count: 0,
             radio_connected: true,
+            tx_retries: 0,
+            tx_failures: 0,
         }
     }
 
@@ -712,6 +748,7 @@ mod tests {
             snr,
             rssi: Some(-80),
             action: PacketAction::Bridged,
+            tx_retry: None,
         }
     }
 
