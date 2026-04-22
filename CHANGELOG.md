@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.1] - 2026-04-22
+
+### Security
+
+- Bump both pinned `rand` versions past [RUSTSEC-2026-0097][adv] (`rand`
+  is unsound with a custom `log::Log` impl that calls `rand::rng()` at
+  trace/warn level and hits the 64 KB reseed path):
+  - `rand 0.9.2` → `0.9.4` (fix `>= 0.9.3`).
+  - `rand 0.8.5` → `0.8.6` (fix `>= 0.8.6`).
+
+  The advisory is only reachable under a very narrow set of conditions
+  (custom logger invoking `rand::rng()` during a reseed while emitting
+  trace-level logs, or warn-level with a failed `getrandom`). We are
+  not known to do that, but shipping the upgrade is the right call.
+
+[adv]: https://rustsec.org/advisories/RUSTSEC-2026-0097
+
 ## [1.0.0] - 2026-04-22
 
 ### Breaking
