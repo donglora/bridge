@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn gossip_frame_roundtrip() {
-        let key = iroh::SecretKey::generate(&mut rand::rng());
+        let key = iroh::SecretKey::generate();
         let frame = GossipFrame::new(&key.public(), -85, 8, vec![1, 2, 3, 4, 5]);
         let encoded = frame.encode();
         let decoded = GossipFrame::decode(&encoded).expect("decode should succeed");
@@ -235,7 +235,7 @@ mod tests {
                 snr in -32i16..=32i16,
                 payload in proptest::collection::vec(any::<u8>(), 0..256),
             ) {
-                let key = iroh::SecretKey::generate(&mut rand::rng());
+                let key = iroh::SecretKey::generate();
                 let frame = GossipFrame::new(&key.public(), rssi, snr, payload.clone());
                 let encoded = frame.encode();
                 let decoded = GossipFrame::decode(&encoded).unwrap();

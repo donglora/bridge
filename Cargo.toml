@@ -14,10 +14,10 @@ rust-version = "1.94.1"
 exclude = [".jj/", ".github/"]
 
 [dependencies]
-donglora-client = "1.0.0"
-iroh = "0.97"
-iroh-gossip = "0.97"
-mainline = { version = "6", features = ["async"] }
+donglora-client = "1"
+iroh = "0.98"
+iroh-gossip = "0.98"
+iroh-gossip-rendezvous = { version = "0.1", path = "../../iroh-gossip-rendezvous" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,10 +34,8 @@ bytes = "1"
 futures-lite = "2"
 rand = "0.9"
 hex = "0.4.3"
-sha2 = "0.10"
 tokio-util = { version = "0.7.18", features = ["rt"] }
 jiff = "0.2.23"
-zeroize = "1"
 
 [dev-dependencies]
 proptest = "1"

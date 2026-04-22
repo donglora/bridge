@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Sparkline};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::gossip::Gossip;
+use crate::gossip::{DhtStatus, Gossip, RendezvousState};
 use crate::radio::ConfigSource;
 use crate::router::{
     PacketAction, PacketDirection, PacketLogEntry, RadioConfigInfo, Stats, StatsSnapshot, TxRetryState,
@@ -210,7 +210,7 @@ fn tui_loop(
         let snap = stats.snapshot();
         let log_slice = log_entries.make_contiguous();
         series.update(&snap, log_slice);
-        let swarm_state = gossip.swarm_state();
+        let swarm_state = gossip.state();
         let config_info = config_watch.borrow().clone();
         terminal.draw(|frame| {
             draw_ui(frame, frame.area(), &config_info, &snap, &swarm_state, log_slice, start_time, series);
@@ -241,7 +241,7 @@ fn draw_ui(
     area: Rect,
     config_info: &RadioConfigInfo,
     stats: &StatsSnapshot,
-    swarm_state: &crate::gossip::SwarmState,
+    swarm_state: &RendezvousState,
     log_entries: &[PacketLogEntry],
     start_time: Instant,
     series: &TimeSeries,
@@ -316,19 +316,20 @@ fn status_pill(label: &str, ok: bool) -> Span<'static> {
 
 // ── Network panel (was Swarm) ────────────────────────────────────
 
-fn draw_network(frame: &mut ratatui::Frame, area: Rect, state: &crate::gossip::SwarmState) {
+fn draw_network(frame: &mut ratatui::Frame, area: Rect, state: &RendezvousState) {
     let block = panel_block(" Network ");
 
     let dht_color = match state.dht_status {
-        crate::gossip::DhtStatus::Ready => Color::Green,
-        crate::gossip::DhtStatus::Bootstrapping => C_RATE_DROP,
-        crate::gossip::DhtStatus::PublishFailed => C_QUEUE_DROP,
+        DhtStatus::Ready => Color::Green,
+        DhtStatus::Bootstrapping => C_RATE_DROP,
+        DhtStatus::PublishFailing => C_QUEUE_DROP,
     };
     let neighbor_color = if state.neighbor_count > 0 { Color::Green } else { C_RATE_DROP };
-    let last_pub = state.last_dht_publish.map_or_else(|| "-".into(), |t| format!("{}s ago", t.elapsed().as_secs()));
+    let last_pub = state.last_publish.map_or_else(|| "-".into(), |t| format!("{}s ago", t.elapsed().as_secs()));
+    let topic_hash = hex::encode(&state.topic_id.as_bytes()[..8]);
 
     let lines = vec![
-        kv_line("ID", &state.topic_hash, C_ACCENT),
+        kv_line("ID", &topic_hash, C_ACCENT),
         kv_line("Peers", &format!("{}", state.neighbor_count), neighbor_color),
         kv_line("DHT", &format!("{}", state.dht_status), dht_color),
         kv_line("Published", &last_pub, C_LABEL),

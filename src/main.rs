@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::gossip::PassphraseKeys;
 use crate::rate_limit::RateLimiter;
 use crate::router::Stats;
 
@@ -66,17 +65,13 @@ async fn main() -> Result<()> {
     setup_logging(cli.log_only, &cfg);
 
     // Ephemeral identity — fresh keypair each launch.
-    let secret_key = SecretKey::generate(&mut rand::rng());
+    let secret_key = SecretKey::generate();
     let node_id = secret_key.public();
     info!("donglora-bridge starting, ephemeral id: {}", node_id.fmt_short());
 
     // Parse radio config.
     let radio_config = cfg.radio.to_lora_config()?;
     let retry_policy = cfg.tx.to_retry_policy()?;
-
-    // Derive passphrase keys.
-    let keys = PassphraseKeys::derive(&cfg.bridge.passphrase);
-    info!("topic: {}", hex::encode(&keys.topic_id.as_bytes()[..8]));
 
     // Create rate limiter.
     let cr_denom: u8 = match radio_config.cr {
@@ -94,8 +89,9 @@ async fn main() -> Result<()> {
     );
     info!("rate limiter: {:.1} pps", rate_limiter.rate_pps());
 
-    // Create gossip network.
-    let (swarm, gossip_event_rx, gossip_frame_tx) = gossip::Gossip::new(secret_key, &keys).await?;
+    // Create gossip network + DHT rendezvous.
+    let (swarm, gossip_event_rx, gossip_frame_tx) =
+        gossip::Gossip::new(secret_key, &cfg.bridge.passphrase).await?;
     let swarm = Arc::new(swarm);
 
     // Start radio.
