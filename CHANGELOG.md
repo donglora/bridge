@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.0.0] - 2026-04-23
+
+### Breaking
+
+- **Partition-healing / DHT-rendezvous extracted to its own crate.**
+  The 700+ lines of gossip-partition-healing logic in `src/gossip.rs`
+  are now the `iroh-gossip-rendezvous` crate on crates.io (pinned
+  here at `^0.1`). Any downstream code that reached into
+  `bridge::gossip::*` for partition types needs to import from
+  `iroh_gossip_rendezvous::*` instead. The normative protocol spec
+  moved with the code — `dht-partition-healing.md` at the bridge
+  root is now a pointer to the new crate's `PROTOCOL.md`.
+- **`iroh` and `iroh-gossip` bumped 0.97 → 0.98** (major; carries
+  iroh's own breaking changes through to any bridge consumers that
+  import from those crates transitively).
+
+### Changed
+
+- Direct deps `mainline`, `sha2`, `zeroize` removed — all now
+  reachable transitively via `iroh-gossip-rendezvous`. Closure is
+  smaller and the rendezvous concern lives in exactly one place.
+- `donglora-client` version spec loosened `"1.0.0"` → `"1"`. Patch
+  and minor releases of the client propagate on the next
+  `cargo build` / `cargo install` without a bridge re-publish;
+  already-released `donglora-client 1.0.1` (CH340K USB bridge
+  support) is picked up automatically.
+
 ## [1.0.1] - 2026-04-22
 
 ### Security
