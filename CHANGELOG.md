@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.0.1] - 2026-04-25
+
+### Fixed
+
+- **TUI quit no longer hangs on a misleading "updating DHT" screen.**
+  The 2.0.0 migration to `iroh-gossip-rendezvous` removed the
+  synchronous mainline-DHT publish that the old `Gossip::shutdown()`
+  performed (rendezvous entries age out instead), but the TUI flow
+  was unchanged: pressing `q` drew an "updating DHT…" overlay,
+  awaited `swarm.shutdown()`, and only then restored the terminal —
+  so the user sat on the stale message for as long as
+  `endpoint.close()` took to flush in-flight connections. Restore
+  the terminal the moment `q` is pressed, drop the overlay, and
+  cap the graceful-shutdown wait at 2 s so a slow endpoint close
+  can't stall the process.
+
 ## [2.0.0] - 2026-04-23
 
 ### Breaking
