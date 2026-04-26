@@ -1,7 +1,7 @@
 use donglora_bridge::{config, gossip, radio, rate_limit, router, setup, tui};
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -174,13 +174,18 @@ async fn main() -> Result<()> {
     } else {
         let terminal = tui::run(config_watch_rx, swarm.clone(), stats, log_rx, cancel.clone(), start_time);
 
-        cancel.cancel();
-        swarm.shutdown().await;
-        info!("donglora-bridge stopped");
-
+        // Restore the terminal first so the user's shell reappears the moment
+        // they hit `q`. iroh-gossip-rendezvous needs no synchronous DHT work
+        // on shutdown — entries age out — so the only remaining wait is
+        // `endpoint.close()` flushing in-flight connections. Bound it.
         if let Ok(mut term) = terminal {
             tui::restore_terminal(&mut term);
         }
+        cancel.cancel();
+        if tokio::time::timeout(Duration::from_secs(2), swarm.shutdown()).await.is_err() {
+            warn!("graceful shutdown timed out — exiting anyway");
+        }
+        info!("donglora-bridge stopped");
 
         return Ok(());
     }

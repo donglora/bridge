@@ -17,7 +17,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -173,7 +173,6 @@ pub fn run(
         &mut series,
     );
 
-    terminal.draw(|frame| draw_shutdown_overlay(frame, frame.area()))?;
     Ok(terminal)
 }
 
@@ -629,29 +628,6 @@ fn pad_right_align(data: &[u64], width: usize) -> Vec<u64> {
     let mut padded = vec![0u64; width.saturating_sub(tail.len())];
     padded.extend_from_slice(tail);
     padded
-}
-
-// ── Shutdown overlay ─────────────────────────────────────────────
-
-fn draw_shutdown_overlay(frame: &mut ratatui::Frame, area: Rect) {
-    let dim = Paragraph::new("").style(Style::default().bg(Color::Black));
-    frame.render_widget(dim, area);
-
-    let w = 36u16;
-    let h = 3u16;
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let popup = Rect::new(x, y, w.min(area.width), h.min(area.height));
-
-    frame.render_widget(Clear, popup);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(C_BORDER));
-    let text = Paragraph::new(Line::from(vec![
-        Span::styled(" Shutting down", Style::default().fg(C_RATE_DROP)),
-        Span::styled(" — updating DHT...", Style::default().fg(C_LABEL)),
-    ]))
-    .alignment(Alignment::Center)
-    .block(block);
-    frame.render_widget(text, popup);
 }
 
 // ── Shared helpers ───────────────────────────────────────────────
